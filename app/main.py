@@ -2,6 +2,7 @@ import gradio as gr
 from dotenv import load_dotenv
 from dewey import Dewey
 from models import AzureSearchConfig, AzureOpenAIConfig
+from models.core import resolve_embedding_dimensions
 import os
 import uuid
 import json
@@ -15,7 +16,11 @@ oai_config = AzureOpenAIConfig(
     embedding_deployment=os.environ["EMBEDDING_DEPLOYMENT_NAME"],
     embedding_model=os.environ["EMBEDDING_MODEL_NAME"],
     chat_deployment=os.environ["CHATGPT_DEPLOYMENT_NAME"],
-    chat_model=os.environ["CHATGPT_MODEL_NAME"]
+    chat_model=os.environ["CHATGPT_MODEL_NAME"],
+    embedding_dimensions=resolve_embedding_dimensions(
+        os.environ["EMBEDDING_MODEL_NAME"],
+        os.environ.get("EMBEDDING_DIMENSIONS"),
+    ),
 )
 
 search_config = AzureSearchConfig(

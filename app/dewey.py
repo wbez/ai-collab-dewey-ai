@@ -101,9 +101,8 @@ class Dewey:
             if author:
                 author_filters.append(f"a eq '{author}'")
 
-        author_filter_text = f"authors/any(a: {' or '.join(author_filters)})"
-        if author_filter_text:
-            filters.append(f"{author_filter_text}")
+        if author_filters:
+            filters.append(f"authors/any(a: {' or '.join(author_filters)})")
 
         return None if len(filters) == 0 else " and ".join(filters)
     
@@ -114,6 +113,7 @@ class Dewey:
         embedding = self.oai_client.embeddings.create(
             model=self.openai_config.embedding_deployment,
             input=metadata["question"],
+            dimensions=self.openai_config.embedding_dimensions,
         )
 
         query_vector = VectorizedQuery(vector=embedding.data[0].embedding, k_nearest_neighbors=50, fields="content_vector")
