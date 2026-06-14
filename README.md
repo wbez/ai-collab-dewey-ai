@@ -55,6 +55,7 @@ AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com"
 AZURE_OPENAI_API_KEY="your-azure-openai-api-key"
 EMBEDDING_DEPLOYMENT_NAME="your-embedding-deployment-name"
 EMBEDDING_MODEL_NAME="text-embedding-3-large"
+EMBEDDING_DIMENSIONS="3072"
 CHATGPT_DEPLOYMENT_NAME="your-chatgpt-deployment-name"
 CHATGPT_MODEL_NAME="gpt-5"
 
@@ -67,6 +68,8 @@ AZURE_SEARCH_INDEX_NAME="your-search-index-name"
 AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=..."
 AZURE_STORAGE_CONTAINER_NAME="your-storage-container-name"
 ```
+
+`EMBEDDING_DIMENSIONS` should match the vectors produced by your embedding deployment and the vectors stored in Azure AI Search. If it is omitted, Dewey infers a default from `EMBEDDING_MODEL_NAME` (`3072` for `text-embedding-3-large`, `1536` for `text-embedding-3-small` and `text-embedding-ada-002`).
 
 ## Deployment
 1. Prepare Your Documents
@@ -105,9 +108,11 @@ This will:
 - Upload documents to blob storage
 - Process documents through AI Search pipeline
 
+If you change `EMBEDDING_MODEL_NAME` or `EMBEDDING_DIMENSIONS`, recreate the index or use a new `AZURE_SEARCH_INDEX_NAME` so the stored vector size matches the query vector size.
+
 3. Launch Dewey
 ```bash
-python main.py
+python app/main.py
 ```
 The application will be available at `http://localhost:7860`. This project uses Gradio to create a user-friendly web interface for our machine learning model. You can learn more about Gradio at https://www.gradio.app/.
 
