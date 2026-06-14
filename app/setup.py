@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Any, List
 import sys
 
+from models.core import resolve_embedding_dimensions
 from setup import SearchManager, SearchInfo, EmbeddingService
 from azure.core.credentials import AzureKeyCredential
 from azure.storage.blob.aio import BlobServiceClient
@@ -58,6 +59,20 @@ class SetupManager:
                 f"\n\nPlease update your .env file at: {self.env_file}"
             )
             raise ConfigurationError(error_msg)
+
+        configured_dimensions = os.getenv("EMBEDDING_DIMENSIONS")
+        try:
+            config["EMBEDDING_DIMENSIONS"] = str(
+                resolve_embedding_dimensions(
+                    config["EMBEDDING_MODEL_NAME"],
+                    configured_dimensions,
+                )
+            )
+        except ValueError as exc:
+            raise ConfigurationError(
+                "Invalid EMBEDDING_DIMENSIONS value in .env file. "
+                "It must be a positive integer."
+            ) from exc
             
         return config
         
@@ -122,7 +137,9 @@ class SetupManager:
         embeddings = EmbeddingService(
             endpoint=config['AZURE_OPENAI_ENDPOINT'],
             deployment=config['EMBEDDING_DEPLOYMENT_NAME'],
-            model_name=config['EMBEDDING_MODEL_NAME']
+            model_name=config['EMBEDDING_MODEL_NAME'],
+            dimensions=config['EMBEDDING_DIMENSIONS'],
+            api_key=config['AZURE_OPENAI_API_KEY'],
         )
         
         # Create search manager
@@ -134,6 +151,7 @@ class SetupManager:
         )
         
         print("🔧 Creating Azure AI Search index...")
+        print(f"   Embedding dimensions: {embeddings.dimensions}")
         await search_manager.create_index()
         print("✅ Index created successfully")
         

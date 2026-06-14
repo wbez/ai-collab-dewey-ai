@@ -1,6 +1,9 @@
+import json
 import logging
 from typing import List, Optional
 
+import aiohttp
+from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.indexes.models import (
     AzureOpenAIVectorizer,
     AzureOpenAIVectorizerParameters,
@@ -15,7 +18,6 @@ from azure.search.documents.indexes.models import (
     SemanticPrioritizedFields,
     SemanticSearch,
     SimpleField,
-    SplitSkill,
     InputFieldMappingEntry,
     OutputFieldMappingEntry,
     VectorSearch,
@@ -56,7 +58,7 @@ class SearchManager:
     ):
         self.search_info = search_info
         self.embeddings = embeddings
-        self.embedding_dimensions = self.embeddings.DIMENSIONS
+        self.embedding_dimensions = self.embeddings.dimensions
         self.blob_connection_string = blob_connection_string
         self.blob_container_name = blob_container_name
 
@@ -64,8 +66,8 @@ class SearchManager:
         logger.info("Checking whether search index %s exists...", self.search_info.index_name)
 
         async with self.search_info.create_search_index_client() as search_index_client:
-
-            if self.search_info.index_name not in [name async for name in search_index_client.list_index_names()]:
+            existing_index_names = [name async for name in search_index_client.list_index_names()]
+            if self.search_info.index_name not in existing_index_names:
                 logger.info("Creating new search index %s", self.search_info.index_name)
                 fields = [
                     SearchField(
@@ -141,6 +143,7 @@ class SearchManager:
                         parameters=AzureOpenAIVectorizerParameters(
                             resource_url=self.embeddings.endpoint,
                             deployment_name=self.embeddings.deployment,
+                            api_key=self.embeddings.api_key,
                             model_name=self.embeddings.model_name,
                         ),
                     )
@@ -182,6 +185,28 @@ class SearchManager:
                 )
 
                 await search_index_client.create_index(index)
+                return
+
+            existing_index = await search_index_client.get_index(self.search_info.index_name)
+            vector_field = next(
+                (field for field in existing_index.fields if field.name == "content_vector"),
+                None,
+            )
+            existing_dimensions = getattr(vector_field, "vector_search_dimensions", None)
+
+            if existing_dimensions != self.embedding_dimensions:
+                raise ValueError(
+                    f"Existing index '{self.search_info.index_name}' uses "
+                    f"{existing_dimensions}-dimensional vectors for 'content_vector', "
+                    f"but the configured embedding deployment uses {self.embedding_dimensions}. "
+                    "Delete the index or choose a new AZURE_SEARCH_INDEX_NAME before rerunning setup."
+                )
+
+            logger.info(
+                "Search index %s already exists with matching vector dimensions (%s).",
+                self.search_info.index_name,
+                self.embedding_dimensions,
+            )
 
     async def create_blob_data_source(self):
         """Create a blob data source for the indexer."""
@@ -199,22 +224,26 @@ class SearchManager:
     async def create_index_skills(self):
         skillset_name = f"{self.search_info.index_name}-skillset"
 
-        split_skill = SplitSkill(
-            name=f"{self.search_info.index_name}-split-skill",
-            description="Split skill to chunk documents",
-            text_split_mode="pages",
-            context="/document",
-            maximum_page_length=512,
-            page_overlap_length=96,
-            maximum_pages_to_take=0,
-            unit="azureOpenAITokens",
-            inputs=[
-                InputFieldMappingEntry(name="text", source="/document/content"),
+        split_skill_payload = {
+            "@odata.type": "#Microsoft.Skills.Text.SplitSkill",
+            "name": f"{self.search_info.index_name}-split-skill",
+            "description": "Split skill to chunk documents",
+            "textSplitMode": "pages",
+            "context": "/document",
+            "maximumPageLength": 512,
+            "pageOverlapLength": 96,
+            "maximumPagesToTake": 0,
+            "unit": "azureOpenAITokens",
+            "azureOpenAITokenizerParameters": {
+                "encoderModelName": "cl100k_base",
+            },
+            "inputs": [
+                {"name": "text", "source": "/document/content"},
             ],
-            outputs=[
-                OutputFieldMappingEntry(name="textItems", target_name="pages")
+            "outputs": [
+                {"name": "textItems", "targetName": "pages"},
             ],
-        )
+        }
 
         text_embedding_skill = AzureOpenAIEmbeddingSkill(
             name=f"{self.search_info.index_name}-text-embedding-skill",
@@ -222,8 +251,9 @@ class SearchManager:
             context="/document/pages/*",
             resource_url=self.embeddings.endpoint,
             deployment_name=self.embeddings.deployment,
+            api_key=self.embeddings.api_key,
             model_name=self.embeddings.model_name,
-            dimensions=self.embeddings.DIMENSIONS,
+            dimensions=self.embeddings.dimensions,
             inputs=[
                 InputFieldMappingEntry(name="text", source="/document/pages/*"),
             ],
@@ -257,11 +287,14 @@ class SearchManager:
         skillset = SearchIndexerSkillset(
             name=skillset_name,
             description="Skillset to process documents and generate embeddings",
-            skills=[split_skill, text_embedding_skill],
+            skills=[text_embedding_skill],
             index_projection=index_projection,
         )
 
-        return skillset
+        skillset_payload = skillset.serialize()
+        skillset_payload["skills"].insert(0, split_skill_payload)
+
+        return skillset_payload
 
     async def create_indexer(self, skillset_name: str, data_source_name: str):
         """Create an indexer to connect data source through skillset to index."""
@@ -290,6 +323,31 @@ class SearchManager:
         
         return indexer, indexer_name
 
+    async def create_or_update_preview_skillset(self, skillset_payload: dict):
+        skillset_name = skillset_payload["name"]
+        url = f"{self.search_info.endpoint}/skillsets/{skillset_name}?api-version=2024-09-01-preview"
+
+        if not isinstance(self.search_info.credential, AzureKeyCredential):
+            raise TypeError("Preview skillset update currently requires an AzureKeyCredential.")
+
+        headers = {
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+            "api-key": self.search_info.credential.key,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.put(
+                url,
+                headers=headers,
+                data=json.dumps(skillset_payload).encode("utf-8"),
+            ) as response:
+                if response.status >= 400:
+                    raise RuntimeError(
+                        f"Failed to create or update preview skillset {skillset_name}: "
+                        f"{response.status} {await response.text()}"
+                    )
+
     async def setup(self):
         ds_client = SearchIndexerClient(endpoint=self.search_info.endpoint, credential=self.search_info.credential)
 
@@ -298,11 +356,12 @@ class SearchManager:
         await ds_client.create_or_update_data_source_connection(data_source)
 
         # Create skillset
-        embedding_skillset = await self.create_index_skills()
-        await ds_client.create_or_update_skillset(embedding_skillset)
+        skillset_payload = await self.create_index_skills()
+        skillset_name = skillset_payload["name"]
+        await self.create_or_update_preview_skillset(skillset_payload)
 
         # Create indexer
-        indexer, indexer_name = await self.create_indexer(embedding_skillset.name, data_source_name)
+        indexer, indexer_name = await self.create_indexer(skillset_name, data_source_name)
         await ds_client.create_or_update_indexer(indexer)
 
         await ds_client.close()
