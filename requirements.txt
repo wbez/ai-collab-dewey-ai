@@ -17,7 +17,9 @@ charset-normalizer==3.4.3
 click==8.2.1
 cryptography==45.0.7
 dataclasses-json==0.6.7
+datasketch==1.6.5
 distro==1.9.0
+editdistance==0.8.1
 fastapi==0.116.1
 ffmpy==0.6.1
 filelock==3.19.1
