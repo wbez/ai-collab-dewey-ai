@@ -96,15 +96,53 @@ class Dewey:
 
         # Authors filter
         author_filters = []
-        author_names = [author['name'] for author in metadata["authors"]]
-        for author in author_names:
-            if author:
-                author_filters.append(f"a eq '{author}'")
+        for author in metadata.get("authors", []):
+            if isinstance(author, dict):
+                author_name = author.get("name", "")
+            else:
+                author_name = str(author)
+
+            author_name = re.sub(r"\s+", " ", author_name).strip()
+            if author_name:
+                escaped_author = author_name.lower().replace("'", "''")
+                author_filters.append(f"tolower(a) eq '{escaped_author}'")
 
         if author_filters:
             filters.append(f"authors/any(a: {' or '.join(author_filters)})")
 
         return None if len(filters) == 0 else " and ".join(filters)
+
+    def _search_articles(self, metadata, filter, vector_queries, search_text, use_semantic):
+        search_kwargs = {
+            "search_text": search_text,
+            "filter": filter,
+            "top": 10,
+            "select": ["url", "headline", "publish_date", "content", "authors"],
+        }
+
+        if vector_queries:
+            search_kwargs["vector_queries"] = vector_queries
+
+        if use_semantic:
+            search_kwargs["query_type"] = QueryType.SEMANTIC
+            search_kwargs["semantic_configuration_name"] = "default"
+            search_kwargs["semantic_query"] = metadata["question"]
+
+        return list(self.search_client.search(**search_kwargs))
+
+    def _format_sources(self, results):
+        sources = []
+
+        for page in results:
+            sources.append(json.dumps({
+                "url": page["url"],
+                "publish_date": f"{parse(page['publish_date']).date().isoformat()}",
+                "authors": page["authors"],
+                "headline": page["headline"],
+                "content": page["content"].replace("\n", " ").replace("\r", " "),
+            }))
+
+        return sources
     
     def retrieve_articles(self, metadata):
         # Prepare vector query
@@ -123,31 +161,28 @@ class Dewey:
         # Build filter
         filter = self.build_filter(metadata)
         print(filter)
-        
+
         # Perform search
-        results = self.search_client.search(
+        results = self._search_articles(
+            metadata,
+            filter,
+            vectors,
             search_text=metadata["question"],
-            filter=filter,
-            top=10,
-            vector_queries=vectors,
-            query_type=QueryType.SEMANTIC,
-            semantic_configuration_name="default",
-            semantic_query=metadata["question"],
-            select=["url", "headline", "publish_date", "content", "authors"]
+            use_semantic=True,
         )
 
-        sources = []
+        # If the user's request is primarily an author filter, the semantic query can
+        # be too generic to match article content. Retry as a filter-only lookup.
+        if not results and metadata.get("authors"):
+            results = self._search_articles(
+                metadata,
+                filter,
+                vector_queries=None,
+                search_text="*",
+                use_semantic=False,
+            )
 
-        for page in results:
-            sources.append(json.dumps({
-                "url": page["url"],
-                "publish_date": f"{parse(page['publish_date']).date().isoformat()}",
-                "authors": page["authors"],
-                "headline": page["headline"],
-                "content":  page["content"].replace("\n", " ").replace("\r", " ")
-            }))
-
-        return sources
+        return self._format_sources(results)
 
     def process(self, message: str, history: List, show_steps: bool=True):
         # Reset steps

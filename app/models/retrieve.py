@@ -1,13 +1,17 @@
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 
 
 class DateRange(BaseModel): 
-    start_date: str = Field(..., description="start_date")
-    end_date: str = Field(..., description="end_date")
+    start_date: Optional[str] = Field(..., description="start_date")
+    end_date: Optional[str] = Field(..., description="end_date")
+
+
+class Author(BaseModel):
+    name: str = Field(..., description="name")
 
 
 class SearchParams(BaseModel):
-    query: str = Field(..., description="query")
+    question: str = Field(..., description="question")
     date_range: DateRange = Field(..., description="date_range")
-    authors: List[str] = Field(..., description="authors")
+    authors: List[Author] = Field(..., description="authors")
