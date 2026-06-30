@@ -1,6 +1,9 @@
+import json
 import logging
 from typing import Dict, List, Optional
 
+import aiohttp
+from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.indexes.aio import SearchIndexerClient
 from azure.search.documents.indexes.models import (
     AzureOpenAIEmbeddingSkill,
@@ -382,13 +385,53 @@ class SearchManager:
         if not transcript_chunks:
             return []
 
-        async with self.search_info.create_search_client() as search_client:
-            upload_result = await search_client.upload_documents(documents=transcript_chunks)
-            failures = [result for result in upload_result if not result.succeeded]
-            if failures:
-                first_error = failures[0]
-                raise RuntimeError(
-                    "Failed to upload transcript chunks to Azure Search: "
-                    f"{getattr(first_error, 'error_message', 'unknown error')}"
-                )
+        if not isinstance(self.search_info.credential, AzureKeyCredential):
+            raise TypeError("Transcript upload currently requires an AzureKeyCredential.")
+
+        endpoint = self.search_info.endpoint.rstrip("/")
+        url = (
+            f"{endpoint}/indexes/{self.search_info.index_name}/docs/index"
+            "?api-version=2024-07-01"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.search_info.credential.key,
+        }
+
+        batch_size = 500
+        async with aiohttp.ClientSession() as session:
+            for start in range(0, len(transcript_chunks), batch_size):
+                batch = transcript_chunks[start : start + batch_size]
+                payload = {
+                    "value": [
+                        {
+                            "@search.action": "upload",
+                            **document,
+                        }
+                        for document in batch
+                    ]
+                }
+                async with session.post(
+                    url,
+                    headers=headers,
+                    data=json.dumps(payload).encode("utf-8"),
+                ) as response:
+                    if response.status >= 400:
+                        raise RuntimeError(
+                            "Failed to upload transcript chunks to Azure Search: "
+                            f"{response.status} {await response.text()}"
+                        )
+
+                    response_payload = await response.json()
+                    failed_items = [
+                        item
+                        for item in response_payload.get("value", [])
+                        if not item.get("status", False)
+                    ]
+                    if failed_items:
+                        first_error = failed_items[0]
+                        raise RuntimeError(
+                            "Failed to upload transcript chunk batch to Azure Search: "
+                            f"{first_error.get('errorMessage', 'unknown error')}"
+                        )
         return transcript_chunks

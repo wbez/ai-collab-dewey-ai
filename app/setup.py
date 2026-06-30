@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 from azure.core.credentials import AzureKeyCredential
 from azure.storage.blob.aio import BlobServiceClient
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 from models.core import resolve_embedding_dimensions
 from setup import EmbeddingService, SearchInfo, SearchManager
@@ -209,7 +210,13 @@ class SetupManager:
                 pass
 
             success_count = 0
-            for index, doc in enumerate(documents):
+            progress = tqdm(
+                enumerate(documents),
+                total=len(documents),
+                desc="Uploading articles",
+                unit="doc",
+            )
+            for index, doc in progress:
                 try:
                     blob_name = f"doc_{doc.get('id', index)}.json"
                     blob_data = json.dumps(doc, ensure_ascii=False, indent=2)
@@ -219,6 +226,7 @@ class SetupManager:
                     )
                     await blob_client.upload_blob(blob_data, overwrite=True)
                     success_count += 1
+                    progress.set_postfix(success=success_count, refresh=False)
                 except Exception as exc:
                     print(f"❌ Error uploading article document {index}: {exc}")
 
