@@ -215,6 +215,7 @@ class SetupManager:
                 total=len(documents),
                 desc="Uploading articles",
                 unit="doc",
+                smoothing=0.6
             )
             for index, doc in progress:
                 try:
