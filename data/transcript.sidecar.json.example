@@ -1,0 +1,19 @@
+{
+  "transcript_url": "https://example.com/transcripts/JF-2004-010_01.vtt",
+  "recording_urls": [
+    "https://example.com/audio/JF-2004-010_01.mp3"
+  ],
+  "title": "John Fetterman Interview",
+  "description": "Interview segment discussing Pennsylvania politics and transit funding.",
+  "program": "Radio Times",
+  "recording_date": "2004-07-31T20:00:00Z",
+  "guests": [
+    "John Fetterman"
+  ],
+  "extra_metadata": {
+    "object_id": "22563",
+    "occurrence_id": "1299",
+    "collection": "cpm-archives-project",
+    "notes": "Optional additional metadata can go here."
+  }
+}

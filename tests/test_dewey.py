@@ -1,0 +1,216 @@
+import importlib.util
+import sys
+import types
+from pathlib import Path
+from types import SimpleNamespace
+
+
+APP_DIR = Path(__file__).resolve().parent.parent / "app"
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
+
+def install_sdk_stubs():
+    azure_module = types.ModuleType("azure")
+    azure_core_module = types.ModuleType("azure.core")
+    azure_credentials_module = types.ModuleType("azure.core.credentials")
+    azure_search_module = types.ModuleType("azure.search")
+    azure_search_documents_module = types.ModuleType("azure.search.documents")
+    azure_search_models_module = types.ModuleType("azure.search.documents.models")
+    openai_module = types.ModuleType("openai")
+
+    class AzureKeyCredential:
+        def __init__(self, key):
+            self.key = key
+
+    class SearchClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class VectorizedQuery:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class QueryType:
+        SEMANTIC = "semantic"
+        FULL = "full"
+
+    class AzureOpenAI:
+        def __init__(self, *args, **kwargs):
+            self.responses = None
+            self.embeddings = None
+
+    azure_credentials_module.AzureKeyCredential = AzureKeyCredential
+    azure_search_documents_module.SearchClient = SearchClient
+    azure_search_models_module.VectorizedQuery = VectorizedQuery
+    azure_search_models_module.VectorQuery = object
+    azure_search_models_module.QueryType = QueryType
+    openai_module.AzureOpenAI = AzureOpenAI
+
+    sys.modules.setdefault("azure", azure_module)
+    sys.modules.setdefault("azure.core", azure_core_module)
+    sys.modules["azure.core.credentials"] = azure_credentials_module
+    sys.modules.setdefault("azure.search", azure_search_module)
+    sys.modules["azure.search.documents"] = azure_search_documents_module
+    sys.modules["azure.search.documents.models"] = azure_search_models_module
+    sys.modules["openai"] = openai_module
+
+
+install_sdk_stubs()
+
+MODULE_PATH = APP_DIR / "dewey.py"
+SPEC = importlib.util.spec_from_file_location("dewey", MODULE_PATH)
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(MODULE)
+
+
+class FakeEmbeddingsClient:
+    def create(self, **kwargs):
+        return SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2, 0.3])])
+
+
+class FakeOpenAIClient:
+    def __init__(self):
+        self.embeddings = FakeEmbeddingsClient()
+
+
+class FakeSearchClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def search(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+def make_dewey(search_responses):
+    dewey = object.__new__(MODULE.Dewey)
+    dewey.oai_client = FakeOpenAIClient()
+    dewey.search_client = FakeSearchClient(search_responses)
+    dewey.openai_config = SimpleNamespace(
+        embedding_deployment="embedding-test",
+        embedding_dimensions=3,
+    )
+    return dewey
+
+
+def test_build_filter_normalizes_and_escapes_author_names():
+    dewey = make_dewey([])
+
+    metadata = {
+        "question": "What did these authors write?",
+        "date_range": {"start_date": None, "end_date": None},
+        "authors": [{"name": " Maureen  O'Connor "}, {"name": "WILL BUNCH"}],
+        "speakers": [],
+        "guests": [],
+        "content_types": [],
+        "program": None,
+    }
+
+    assert dewey.build_filter(metadata) == (
+        "authors/any(a: tolower(a) eq 'maureen o''connor' or "
+        "tolower(a) eq 'will bunch')"
+    )
+
+
+def test_build_filter_supports_transcript_fields():
+    dewey = make_dewey([])
+    metadata = {
+        "question": "What did John say on Radio Times?",
+        "date_range": {"start_date": "2024-01-01", "end_date": "2024-12-31"},
+        "authors": [],
+        "speakers": [{"name": "John Doe"}],
+        "guests": [{"name": "Jane Guest"}],
+        "content_types": ["transcript"],
+        "program": "Radio Times",
+    }
+
+    assert dewey.build_filter(metadata) == (
+        "publish_date ge 2024-01-01T00:00:00Z and "
+        "publish_date le 2024-12-31T23:59:59Z and "
+        "(content_type eq 'transcript') and "
+        "program eq 'Radio Times' and "
+        "guests/any(a: tolower(a) eq 'jane guest') and "
+        "speakers/any(a: tolower(a) eq 'john doe')"
+    )
+
+
+def test_retrieve_articles_uses_fuzzy_fallback_for_author_queries():
+    fuzzy_page = {
+        "url": "https://example.com/story",
+        "publish_date": "2026-01-02T12:00:00Z",
+        "authors": ["Will Bnch"],
+        "headline": "Story",
+        "content": "Article body",
+        "content_type": "article",
+    }
+    dewey = make_dewey([[], [fuzzy_page]])
+
+    metadata = {
+        "question": "septa strike",
+        "date_range": {"start_date": None, "end_date": None},
+        "authors": [{"name": "Will Bunch"}],
+        "speakers": [],
+        "guests": [],
+        "content_types": ["article"],
+        "program": None,
+    }
+
+    sources = dewey.retrieve_articles(metadata)
+
+    assert len(sources) == 1
+    assert len(dewey.search_client.calls) == 2
+
+    first_call, second_call = dewey.search_client.calls
+    assert first_call["search_text"] == metadata["question"]
+    assert first_call["query_type"] == MODULE.QueryType.SEMANTIC
+    assert "vector_queries" in first_call
+    assert "authors/any" in first_call["filter"]
+
+    assert second_call["query_type"] == MODULE.QueryType.FULL
+    assert second_call["search_fields"] == ["search_text", "author_search_text", "speaker_search_text"]
+    assert "author_search_text:will~" in second_call["search_text"]
+    assert "author_search_text:bunch~" in second_call["search_text"]
+    assert "search_text:septa" in second_call["search_text"]
+    assert "vector_queries" not in second_call
+
+
+def test_retrieve_articles_formats_transcript_sources():
+    transcript_page = {
+        "url": "https://example.com/transcript",
+        "transcript_url": "https://example.com/transcript",
+        "recording_urls": ["https://example.com/audio.mp3"],
+        "publish_date": "2026-01-02T12:00:00Z",
+        "authors": [],
+        "speakers": ["Host", "Guest"],
+        "guests": ["Guest"],
+        "program": "Radio Times",
+        "headline": "Episode Title",
+        "content": "Transcript body",
+        "content_type": "transcript",
+        "chunk_id": "chunk-1",
+        "timestamp_label": "00:00:01.000 - 00:00:07.000",
+        "start_seconds": 1.0,
+        "end_seconds": 7.0,
+    }
+    dewey = make_dewey([[transcript_page]])
+
+    metadata = {
+        "question": "What did the guest say?",
+        "date_range": {"start_date": None, "end_date": None},
+        "authors": [],
+        "speakers": [],
+        "guests": [],
+        "content_types": ["transcript"],
+        "program": None,
+    }
+
+    sources = dewey.retrieve_articles(metadata)
+
+    payload = MODULE.json.loads(sources[0])
+    assert payload["content_type"] == "transcript"
+    assert payload["transcript_url"] == "https://example.com/transcript"
+    assert payload["recording_urls"] == ["https://example.com/audio.mp3"]
+    assert payload["timestamp_label"] == "00:00:01.000 - 00:00:07.000"

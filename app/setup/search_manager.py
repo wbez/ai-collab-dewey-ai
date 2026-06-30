@@ -1,52 +1,47 @@
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
+from azure.search.documents.indexes.aio import SearchIndexerClient
 from azure.search.documents.indexes.models import (
+    AzureOpenAIEmbeddingSkill,
     AzureOpenAIVectorizer,
     AzureOpenAIVectorizerParameters,
+    FieldMapping,
     HnswAlgorithmConfiguration,
     HnswParameters,
-    SearchableField,
+    IndexProjectionMode,
+    InputFieldMappingEntry,
+    OutputFieldMappingEntry,
     SearchField,
     SearchFieldDataType,
     SearchIndex,
+    SearchIndexer,
+    SearchIndexerDataContainer,
+    SearchIndexerDataSourceConnection,
+    SearchIndexerIndexProjection,
+    SearchIndexerIndexProjectionSelector,
+    SearchIndexerIndexProjectionsParameters,
+    SearchIndexerSkillset,
+    SearchableField,
     SemanticConfiguration,
     SemanticField,
     SemanticPrioritizedFields,
     SemanticSearch,
     SimpleField,
     SplitSkill,
-    InputFieldMappingEntry,
-    OutputFieldMappingEntry,
     VectorSearch,
     VectorSearchProfile,
     VectorSearchVectorizer,
-    AzureOpenAIEmbeddingSkill,
-    SearchIndexerSkillset,
-    SearchIndexerIndexProjection,
-    SearchIndexerIndexProjectionSelector,
-    SearchIndexerIndexProjectionsParameters,
-    IndexProjectionMode,
-    SearchIndexerDataSourceConnection,
-    SearchIndexerDataContainer,
-    SearchIndexer,
-    FieldMapping,
 )
 
-from azure.search.documents.indexes.aio import SearchIndexerClient
-from .search_service import SearchInfo
 from .embedding_service import EmbeddingService
+from .search_service import SearchInfo
 
 
 logger = logging.getLogger("scripts")
 
 
 class SearchManager:
-    """
-    Class to manage a search service. It can create indexes, and update or remove sections stored in these indexes
-    To learn more, please visit https://learn.microsoft.com/azure/search/search-what-is-azure-search
-    """
-
     def __init__(
         self,
         search_info: SearchInfo,
@@ -56,7 +51,7 @@ class SearchManager:
     ):
         self.search_info = search_info
         self.embeddings = embeddings
-        self.embedding_dimensions = self.embeddings.DIMENSIONS
+        self.embedding_dimensions = self.embeddings.dimensions
         self.blob_connection_string = blob_connection_string
         self.blob_container_name = blob_container_name
 
@@ -64,26 +59,29 @@ class SearchManager:
         logger.info("Checking whether search index %s exists...", self.search_info.index_name)
 
         async with self.search_info.create_search_index_client() as search_index_client:
-
-            if self.search_info.index_name not in [name async for name in search_index_client.list_index_names()]:
-                logger.info("Creating new search index %s", self.search_info.index_name)
+            existing_index_names = [name async for name in search_index_client.list_index_names()]
+            if self.search_info.index_name not in existing_index_names:
                 fields = [
                     SearchField(
-                        name="chunk_id", 
-                        type="Edm.String", 
+                        name="chunk_id",
+                        type="Edm.String",
                         key=True,
                         filterable=True,
                         sortable=True,
                         facetable=True,
                         analyzer_name="keyword",
                     ),
+                    SearchableField(name="content", type="Edm.String", analyzer_name="standard.lucene"),
+                    SearchableField(name="search_text", type="Edm.String", analyzer_name="standard.lucene"),
+                    SearchableField(name="headline", type="Edm.String", analyzer_name="standard.lucene"),
+                    SearchableField(name="description", type="Edm.String", analyzer_name="standard.lucene"),
                     SearchableField(
-                        name="content",
+                        name="author_search_text",
                         type="Edm.String",
                         analyzer_name="standard.lucene",
                     ),
                     SearchableField(
-                        name="headline",
+                        name="speaker_search_text",
                         type="Edm.String",
                         analyzer_name="standard.lucene",
                     ),
@@ -98,12 +96,23 @@ class SearchManager:
                         vector_search_dimensions=self.embedding_dimensions,
                         vector_search_profile_name="embedding_config",
                     ),
-                    SimpleField(
-                        name="url",
-                        type="Edm.String",
-                    ),
+                    SimpleField(name="url", type="Edm.String"),
                     SimpleField(
                         name="authors",
+                        type="Collection(Edm.String)",
+                        filterable=True,
+                        facetable=True,
+                        retrievable=True,
+                    ),
+                    SimpleField(
+                        name="speakers",
+                        type="Collection(Edm.String)",
+                        filterable=True,
+                        facetable=True,
+                        retrievable=True,
+                    ),
+                    SimpleField(
+                        name="guests",
                         type="Collection(Edm.String)",
                         filterable=True,
                         facetable=True,
@@ -116,31 +125,70 @@ class SearchManager:
                         sortable=True,
                         facetable=True,
                         retrievable=True,
-                        searchable=False
+                        searchable=False,
                     ),
                     SimpleField(
-                        name="sourcepage",
-                        type="Edm.String",
+                        name="recording_date",
+                        type="Edm.DateTimeOffset",
                         filterable=True,
+                        sortable=True,
                         facetable=True,
+                        retrievable=True,
+                        searchable=False,
                     ),
+                    SimpleField(name="sourcepage", type="Edm.String", filterable=True, facetable=True),
                     SearchableField(
-                        name="parent_id", 
+                        name="parent_id",
                         type="Edm.String",
                         analyzer_name="standard.lucene",
                         filterable=True,
-                        sortable=False,
-                        facetable=False,
                         retrievable=True,
-                    )
+                    ),
+                    SimpleField(
+                        name="content_type",
+                        type="Edm.String",
+                        filterable=True,
+                        facetable=True,
+                        retrievable=True,
+                    ),
+                    SimpleField(
+                        name="program",
+                        type="Edm.String",
+                        filterable=True,
+                        facetable=True,
+                        retrievable=True,
+                    ),
+                    SimpleField(name="transcript_url", type="Edm.String", retrievable=True),
+                    SimpleField(
+                        name="recording_urls",
+                        type="Collection(Edm.String)",
+                        retrievable=True,
+                    ),
+                    SimpleField(name="timestamp_label", type="Edm.String", retrievable=True),
+                    SimpleField(
+                        name="start_seconds",
+                        type="Edm.Double",
+                        filterable=True,
+                        sortable=True,
+                        retrievable=True,
+                    ),
+                    SimpleField(
+                        name="end_seconds",
+                        type="Edm.Double",
+                        filterable=True,
+                        sortable=True,
+                        retrievable=True,
+                    ),
+                    SimpleField(name="raw_metadata_json", type="Edm.String", retrievable=True),
                 ]
 
-                vectorizers = [
+                vectorizers = vectorizers or [
                     AzureOpenAIVectorizer(
                         vectorizer_name=f"{self.search_info.index_name}-vectorizer",
                         parameters=AzureOpenAIVectorizerParameters(
                             resource_url=self.embeddings.endpoint,
                             deployment_name=self.embeddings.deployment,
+                            api_key=self.embeddings.api_key,
                             model_name=self.embeddings.model_name,
                         ),
                     )
@@ -154,9 +202,16 @@ class SearchManager:
                             SemanticConfiguration(
                                 name="default",
                                 prioritized_fields=SemanticPrioritizedFields(
-                                    title_field=SemanticField(field_name="headline"), 
-                                    content_fields=[SemanticField(field_name="content")],
-                                    keywords_fields=[SemanticField(field_name="content")],
+                                    title_field=SemanticField(field_name="headline"),
+                                    content_fields=[
+                                        SemanticField(field_name="search_text"),
+                                        SemanticField(field_name="content"),
+                                        SemanticField(field_name="description"),
+                                    ],
+                                    keywords_fields=[
+                                        SemanticField(field_name="author_search_text"),
+                                        SemanticField(field_name="speaker_search_text"),
+                                    ],
                                 ),
                             )
                         ]
@@ -172,28 +227,37 @@ class SearchManager:
                             VectorSearchProfile(
                                 name="embedding_config",
                                 algorithm_configuration_name="hnsw_config",
-                                vectorizer_name=(
-                                    f"{self.search_info.index_name}-vectorizer"
-                                ),
-                            ),
+                                vectorizer_name=f"{self.search_info.index_name}-vectorizer",
+                            )
                         ],
                         vectorizers=vectorizers,
                     ),
                 )
 
                 await search_index_client.create_index(index)
+                return
+
+            existing_index = await search_index_client.get_index(self.search_info.index_name)
+            vector_field = next(
+                (field for field in existing_index.fields if field.name == "content_vector"),
+                None,
+            )
+            existing_dimensions = getattr(vector_field, "vector_search_dimensions", None)
+            if existing_dimensions != self.embedding_dimensions:
+                raise ValueError(
+                    f"Existing index '{self.search_info.index_name}' uses "
+                    f"{existing_dimensions}-dimensional vectors, but the configured "
+                    f"embedding deployment uses {self.embedding_dimensions}."
+                )
 
     async def create_blob_data_source(self):
-        """Create a blob data source for the indexer."""
         data_source_name = f"{self.search_info.index_name}-blob-ds"
-        
         data_source = SearchIndexerDataSourceConnection(
             name=data_source_name,
             type="azureblob",
             connection_string=self.blob_connection_string,
-            container=SearchIndexerDataContainer(name=self.blob_container_name)
+            container=SearchIndexerDataContainer(name=self.blob_container_name),
         )
-        
         return data_source, data_source_name
 
     async def create_index_skills(self):
@@ -201,35 +265,28 @@ class SearchManager:
 
         split_skill = SplitSkill(
             name=f"{self.search_info.index_name}-split-skill",
-            description="Split skill to chunk documents",
+            description="Split article documents into chunks",
             text_split_mode="pages",
             context="/document",
             maximum_page_length=512,
             page_overlap_length=96,
             maximum_pages_to_take=0,
             unit="azureOpenAITokens",
-            inputs=[
-                InputFieldMappingEntry(name="text", source="/document/content"),
-            ],
-            outputs=[
-                OutputFieldMappingEntry(name="textItems", target_name="pages")
-            ],
+            inputs=[InputFieldMappingEntry(name="text", source="/document/content")],
+            outputs=[OutputFieldMappingEntry(name="textItems", target_name="pages")],
         )
 
         text_embedding_skill = AzureOpenAIEmbeddingSkill(
             name=f"{self.search_info.index_name}-text-embedding-skill",
-            description="Embedding skill to generate embeddings",
+            description="Embedding skill to generate embeddings for article chunks",
             context="/document/pages/*",
             resource_url=self.embeddings.endpoint,
             deployment_name=self.embeddings.deployment,
+            api_key=self.embeddings.api_key,
             model_name=self.embeddings.model_name,
-            dimensions=self.embeddings.DIMENSIONS,
-            inputs=[
-                InputFieldMappingEntry(name="text", source="/document/pages/*"),
-            ],
-            outputs=[
-                OutputFieldMappingEntry(name="embedding", target_name="content_vector")
-            ],
+            dimensions=self.embedding_dimensions,
+            inputs=[InputFieldMappingEntry(name="text", source="/document/pages/*")],
+            outputs=[OutputFieldMappingEntry(name="embedding", target_name="content_vector")],
         )
 
         index_projection = SearchIndexerIndexProjection(
@@ -240,81 +297,98 @@ class SearchManager:
                     source_context="/document/pages/*",
                     mappings=[
                         InputFieldMappingEntry(name="content", source="/document/pages/*"),
+                        InputFieldMappingEntry(name="search_text", source="/document/pages/*"),
                         InputFieldMappingEntry(name="headline", source="/document/headline"),
-                        InputFieldMappingEntry(name="content_vector", source="/document/pages/*/content_vector"),
+                        InputFieldMappingEntry(name="description", source="/document/description"),
+                        InputFieldMappingEntry(
+                            name="content_vector",
+                            source="/document/pages/*/content_vector",
+                        ),
                         InputFieldMappingEntry(name="url", source="/document/url"),
                         InputFieldMappingEntry(name="authors", source="/document/authors"),
+                        InputFieldMappingEntry(
+                            name="author_search_text",
+                            source="/document/author_search_text",
+                        ),
                         InputFieldMappingEntry(name="publish_date", source="/document/publish_date"),
                         InputFieldMappingEntry(name="sourcepage", source="/document/metadata_storage_name"),
+                        InputFieldMappingEntry(name="content_type", source="/document/content_type"),
                     ],
-                ),
+                )
             ],
             parameters=SearchIndexerIndexProjectionsParameters(
                 projection_mode=IndexProjectionMode.SKIP_INDEXING_PARENT_DOCUMENTS
             ),
         )
 
-        skillset = SearchIndexerSkillset(
+        return SearchIndexerSkillset(
             name=skillset_name,
-            description="Skillset to process documents and generate embeddings",
+            description="Skillset to process article documents and generate embeddings",
             skills=[split_skill, text_embedding_skill],
             index_projection=index_projection,
         )
 
-        return skillset
-
     async def create_indexer(self, skillset_name: str, data_source_name: str):
-        """Create an indexer to connect data source through skillset to index."""
         indexer_name = f"{self.search_info.index_name}-indexer"
-        
         indexer = SearchIndexer(
             name=indexer_name,
-            description="Indexer to automatically process documents through skillset",
+            description="Indexer to process article documents through skillset",
             skillset_name=skillset_name,
             target_index_name=self.search_info.index_name,
             data_source_name=data_source_name,
             field_mappings=[
                 FieldMapping(source_field_name="content", target_field_name="content"),
                 FieldMapping(source_field_name="headline", target_field_name="headline"),
+                FieldMapping(source_field_name="description", target_field_name="description"),
                 FieldMapping(source_field_name="url", target_field_name="url"),
                 FieldMapping(source_field_name="authors", target_field_name="authors"),
+                FieldMapping(
+                    source_field_name="author_search_text",
+                    target_field_name="author_search_text",
+                ),
                 FieldMapping(source_field_name="publish_date", target_field_name="publish_date"),
+                FieldMapping(source_field_name="content_type", target_field_name="content_type"),
             ],
             parameters={
                 "configuration": {
                     "parsingMode": "json",
-                    "dataToExtract": "contentAndMetadata"
+                    "dataToExtract": "contentAndMetadata",
                 }
-            }
+            },
         )
-        
         return indexer, indexer_name
 
     async def setup(self):
-        ds_client = SearchIndexerClient(endpoint=self.search_info.endpoint, credential=self.search_info.credential)
+        ds_client = SearchIndexerClient(
+            endpoint=self.search_info.endpoint,
+            credential=self.search_info.credential,
+        )
 
-        # Create blob data source
         data_source, data_source_name = await self.create_blob_data_source()
         await ds_client.create_or_update_data_source_connection(data_source)
 
-        # Create skillset
         embedding_skillset = await self.create_index_skills()
         await ds_client.create_or_update_skillset(embedding_skillset)
 
-        # Create indexer
-        indexer, indexer_name = await self.create_indexer(embedding_skillset.name, data_source_name)
+        indexer, indexer_name = await self.create_indexer(
+            embedding_skillset.name,
+            data_source_name,
+        )
         await ds_client.create_or_update_indexer(indexer)
-
         await ds_client.close()
-
         return indexer_name
 
+    async def upload_transcript_chunks(self, transcript_chunks: List[Dict[str, object]]):
+        if not transcript_chunks:
+            return []
 
-async def main(search_info, embeddings):
-    search_manager = SearchManager(
-        search_info,
-        embeddings
-    )
-
-    await search_manager.create_index()
-    await search_manager.setup()
+        async with self.search_info.create_search_client() as search_client:
+            upload_result = await search_client.upload_documents(documents=transcript_chunks)
+            failures = [result for result in upload_result if not result.succeeded]
+            if failures:
+                first_error = failures[0]
+                raise RuntimeError(
+                    "Failed to upload transcript chunks to Azure Search: "
+                    f"{getattr(first_error, 'error_message', 'unknown error')}"
+                )
+        return transcript_chunks

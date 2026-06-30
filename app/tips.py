@@ -1,9 +1,10 @@
 class TipFormatter:
+    @staticmethod
     def tip_metadata(metadata: dict):
-        search_text = f"🔍 Searched \"{metadata['question']}\""
+        search_text = f'🔍 Searched "{metadata["question"]}"'
 
-        start_date = metadata['date_range']['start_date']
-        end_date = metadata['date_range']['end_date']
+        start_date = metadata["date_range"]["start_date"]
+        end_date = metadata["date_range"]["end_date"]
 
         date_text = ""
         if start_date and end_date:
@@ -13,15 +14,38 @@ class TipFormatter:
         elif end_date:
             date_text = f"⏳ Until {end_date}"
 
-        author_text = ""
-        author_names = [author['name'] for author in metadata['authors']]
-        if len(metadata["authors"]) == 1:
-            author_text = f"🖊️ Written by {author_names[0]}"
-        elif len(metadata['authors']) > 1:
-            author_text = f"🖊️ Written by {', '.join(author_names[:-1])}{',' if len(author_names) > 2 else ''} and {author_names[-1]}"
+        author_names = [author["name"] for author in metadata.get("authors", [])]
+        speaker_names = [speaker["name"] for speaker in metadata.get("speakers", [])]
+        content_types = metadata.get("content_types", [])
 
-        text_blocks = filter(lambda x: len(x) > 0, [search_text, date_text, author_text])
+        author_text = ""
+        if len(author_names) == 1:
+            author_text = f"🖊️ Written by {author_names[0]}"
+        elif len(author_names) > 1:
+            author_text = (
+                f"🖊️ Written by {', '.join(author_names[:-1])}"
+                f"{',' if len(author_names) > 2 else ''} and {author_names[-1]}"
+            )
+
+        speaker_text = ""
+        if len(speaker_names) == 1:
+            speaker_text = f"🎙️ Speaker {speaker_names[0]}"
+        elif len(speaker_names) > 1:
+            speaker_text = (
+                f"🎙️ Speakers {', '.join(speaker_names[:-1])}"
+                f"{',' if len(speaker_names) > 2 else ''} and {speaker_names[-1]}"
+            )
+
+        scope_text = ""
+        if len(content_types) == 1:
+            scope_text = f"📚 Scope: {content_types[0]}"
+
+        text_blocks = filter(
+            lambda x: len(x) > 0,
+            [search_text, date_text, author_text, speaker_text, scope_text],
+        )
         return "\n".join(text_blocks)
-    
+
+    @staticmethod
     def tip_search(sources: list):
-        return f"🔍 Retrieved {len(sources)} articles."
+        return f"🔍 Retrieved {len(sources)} result(s)."

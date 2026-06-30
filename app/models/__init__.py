@@ -1,4 +1,10 @@
-from .retrieve import SearchParams, DateRange
-from .core import AzureSearchConfig, AzureOpenAIConfig
+from .core import AzureOpenAIConfig, AzureSearchConfig
+from .retrieve import DateRange, NamedEntity, SearchParams
 
-__all__ = ["SearchParams", "DateRange", "AzureSearchConfig", "OpenAIConfig"]
+__all__ = [
+    "AzureOpenAIConfig",
+    "AzureSearchConfig",
+    "DateRange",
+    "NamedEntity",
+    "SearchParams",
+]
