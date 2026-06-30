@@ -24,6 +24,7 @@ SPEAKER_PREFIX_PATTERN = re.compile(r"^([^:\n]{1,80}):\s*(.+)$", re.DOTALL)
 WHITESPACE_PATTERN = re.compile(r"\s+")
 
 KNOWN_TRANSCRIPT_FIELDS = {
+    "transcript_name",
     "title",
     "description",
     "program",
@@ -32,6 +33,7 @@ KNOWN_TRANSCRIPT_FIELDS = {
     "recording_urls",
     "guests",
     "extra_metadata",
+    "collective_access_metadata",
 }
 
 
@@ -201,14 +203,31 @@ def load_transcript_document(vtt_path: Path, metadata_path: Path) -> Dict[str, A
         for key, value in merged_metadata.items()
         if key not in KNOWN_TRANSCRIPT_FIELDS
     }
+    if merged_metadata.get("collective_access_metadata"):
+        extra_metadata["collective_access_metadata"] = merged_metadata["collective_access_metadata"]
     if notes:
         extra_metadata.setdefault("vtt_notes", notes)
 
     recording_urls = merged_metadata.get("recording_urls") or []
     if isinstance(recording_urls, str):
         recording_urls = [recording_urls]
-    if not recording_urls and merged_metadata.get("source_url"):
-        recording_urls = [merged_metadata["source_url"]]
+    normalized_recording_urls: List[str] = []
+    for value in recording_urls:
+        if isinstance(value, dict):
+            url = value.get("url")
+            if url:
+                normalized_recording_urls.append(str(url))
+        elif value:
+            normalized_recording_urls.append(str(value))
+    if not normalized_recording_urls and merged_metadata.get("source_url"):
+        normalized_recording_urls = [merged_metadata["source_url"]]
+    if not normalized_recording_urls:
+        source_urls = [
+            value
+            for key, value in merged_metadata.items()
+            if key.startswith("source_url[") and value
+        ]
+        normalized_recording_urls = [str(value) for value in source_urls]
 
     guests = merged_metadata.get("guests") or []
     if isinstance(guests, str):
@@ -228,12 +247,15 @@ def load_transcript_document(vtt_path: Path, metadata_path: Path) -> Dict[str, A
     )
 
     transcript_url = merged_metadata.get("transcript_url")
-    if not transcript_url:
-        raise ValueError(f"Transcript sidecar {metadata_path.name} is missing transcript_url.")
+    if transcript_url:
+        transcript_url = str(transcript_url)
 
+    collective_access_metadata = merged_metadata.get("collective_access_metadata") or {}
     return {
         "id": str(
-            merged_metadata.get("object_id")
+            collective_access_metadata.get("object_id")
+            or merged_metadata.get("object_id")
+            or collective_access_metadata.get("occurrence_id")
             or merged_metadata.get("occurrence_id")
             or vtt_path.stem
         ),
@@ -242,7 +264,8 @@ def load_transcript_document(vtt_path: Path, metadata_path: Path) -> Dict[str, A
         "program": merged_metadata.get("program"),
         "recording_date": recording_date,
         "transcript_url": transcript_url,
-        "recording_urls": recording_urls,
+        "transcript_name": merged_metadata.get("transcript_name") or vtt_path.name,
+        "recording_urls": normalized_recording_urls,
         "guests": [normalize_whitespace(guest) for guest in guests if normalize_whitespace(guest)],
         "extra_metadata": extra_metadata,
         "cues": cues,
@@ -306,7 +329,7 @@ def build_transcript_chunks(document: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "content": chunk["content"],
                 "search_text": search_text,
                 "raw_metadata_json": json.dumps(document.get("extra_metadata", {}), ensure_ascii=False),
-                "url": document["transcript_url"],
+                "url": document["transcript_url"] or (document.get("recording_urls") or [None])[0],
                 "authors": [],
             }
         )

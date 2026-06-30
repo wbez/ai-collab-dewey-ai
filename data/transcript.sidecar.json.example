@@ -1,7 +1,11 @@
 {
-  "transcript_url": "https://example.com/transcripts/JF-2004-010_01.vtt",
+  "transcript_name": "JF-2004-010_01.vtt",
   "recording_urls": [
-    "https://example.com/audio/JF-2004-010_01.mp3"
+    {
+      "url": "https://example.com/audio/JF-2004-010_01.mp3",
+      "length": 3118.0,
+      "size": "74833920"
+    }
   ],
   "title": "John Fetterman Interview",
   "description": "Interview segment discussing Pennsylvania politics and transit funding.",
@@ -10,9 +14,12 @@
   "guests": [
     "John Fetterman"
   ],
-  "extra_metadata": {
+  "collective_access_metadata": {
     "object_id": "22563",
     "occurrence_id": "1299",
+    "matched_by": "occurrence_id"
+  },
+  "extra_metadata": {
     "collection": "cpm-archives-project",
     "notes": "Optional additional metadata can go here."
   }

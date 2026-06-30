@@ -66,9 +66,21 @@ def test_build_transcript_chunks_merges_short_turns(tmp_path):
     metadata_path.write_text(
         """
         {
-          "transcript_url": "https://example.com/transcript",
+          "transcript_name": "episode.vtt",
+          "recording_urls": [
+            {
+              "url": "https://example.com/audio.mp3",
+              "length": 120.0,
+              "size": "1024"
+            }
+          ],
           "program": "Radio Times",
-          "guests": ["Guest Name"]
+          "guests": ["Guest Name"],
+          "collective_access_metadata": {
+            "object_id": "22563",
+            "occurrence_id": "1299",
+            "matched_by": "occurrence_id"
+          }
         }
         """,
         encoding="utf-8",
@@ -79,10 +91,13 @@ def test_build_transcript_chunks_merges_short_turns(tmp_path):
 
     assert chunks
     assert chunks[0]["content_type"] == "transcript"
-    assert chunks[0]["transcript_url"] == "https://example.com/transcript"
+    assert chunks[0]["transcript_url"] is None
     assert chunks[0]["recording_urls"] == ["https://example.com/audio.mp3"]
+    assert chunks[0]["url"] == "https://example.com/audio.mp3"
     assert "Host" in chunks[0]["speakers"]
     assert "Guest" in chunks[0]["speakers"]
     assert chunks[0]["program"] == "Radio Times"
     assert chunks[0]["speaker_search_text"]
     assert "Transcript excerpt:" in chunks[0]["search_text"]
+    assert document["id"] == "22563"
+    assert document["transcript_name"] == "episode.vtt"
