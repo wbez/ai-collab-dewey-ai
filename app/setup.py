@@ -230,10 +230,28 @@ class SetupManager:
         await search_manager.create_index()
         print("✅ Index created successfully")
 
+        await self.ensure_blob_container(
+            config["AZURE_STORAGE_CONNECTION_STRING"],
+            config["AZURE_STORAGE_CONTAINER_NAME"],
+        )
+
         print("⚙️  Setting up article skillset and indexer...")
         indexer_name = await search_manager.setup()
         print(f"✅ Skillset and indexer '{indexer_name}' created successfully")
         return search_info, embeddings, search_manager
+
+    async def ensure_blob_container(
+        self,
+        blob_connection_string: str,
+        container_name: str,
+    ):
+        async with BlobServiceClient.from_connection_string(blob_connection_string) as blob_service_client:
+            container_client = blob_service_client.get_container_client(container_name)
+            try:
+                await container_client.create_container()
+                print(f"✅ Created container '{container_name}'")
+            except Exception:
+                pass
 
     async def upload_documents_to_blob(
         self,
@@ -250,7 +268,6 @@ class SetupManager:
             container_client = blob_service_client.get_container_client(container_name)
             try:
                 await container_client.create_container()
-                print(f"✅ Created container '{container_name}'")
             except Exception:
                 pass
 

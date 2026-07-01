@@ -374,20 +374,21 @@ class SearchManager:
             endpoint=self.search_info.endpoint,
             credential=self.search_info.credential,
         )
+        try:
+            data_source, data_source_name = await self.create_blob_data_source()
+            await ds_client.create_or_update_data_source_connection(data_source)
 
-        data_source, data_source_name = await self.create_blob_data_source()
-        await ds_client.create_or_update_data_source_connection(data_source)
+            embedding_skillset = await self.create_index_skills()
+            await ds_client.create_or_update_skillset(embedding_skillset)
 
-        embedding_skillset = await self.create_index_skills()
-        await ds_client.create_or_update_skillset(embedding_skillset)
-
-        indexer, indexer_name = await self.create_indexer(
-            embedding_skillset.name,
-            data_source_name,
-        )
-        await ds_client.create_or_update_indexer(indexer)
-        await ds_client.close()
-        return indexer_name
+            indexer, indexer_name = await self.create_indexer(
+                embedding_skillset.name,
+                data_source_name,
+            )
+            await ds_client.create_or_update_indexer(indexer)
+            return indexer_name
+        finally:
+            await ds_client.close()
 
     async def cleanup_search_resources(self):
         names = self.resource_names()
