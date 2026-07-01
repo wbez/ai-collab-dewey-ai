@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import aiohttp
 from azure.core.credentials import AzureKeyCredential
@@ -57,6 +57,14 @@ class SearchManager:
         self.embedding_dimensions = self.embeddings.dimensions
         self.blob_connection_string = blob_connection_string
         self.blob_container_name = blob_container_name
+
+    def resource_names(self) -> Dict[str, str]:
+        return {
+            "data_source": f"{self.search_info.index_name}-blob-ds",
+            "skillset": f"{self.search_info.index_name}-skillset",
+            "indexer": f"{self.search_info.index_name}-indexer",
+            "index": self.search_info.index_name,
+        }
 
     async def create_index(self, vectorizers: Optional[List[VectorSearchVectorizer]] = None):
         logger.info("Checking whether search index %s exists...", self.search_info.index_name)
@@ -381,7 +389,118 @@ class SearchManager:
         await ds_client.close()
         return indexer_name
 
-    async def upload_transcript_chunks(self, transcript_chunks: List[Dict[str, object]]):
+    async def cleanup_search_resources(self):
+        names = self.resource_names()
+
+        async with self.search_info.create_search_indexer_client() as indexer_client:
+            for delete_fn, name in [
+                (indexer_client.delete_indexer, names["indexer"]),
+                (indexer_client.delete_skillset, names["skillset"]),
+                (indexer_client.delete_data_source_connection, names["data_source"]),
+            ]:
+                try:
+                    await delete_fn(name)
+                except Exception:
+                    pass
+
+        async with self.search_info.create_search_index_client() as index_client:
+            try:
+                await index_client.delete_index(names["index"])
+            except Exception:
+                pass
+
+    async def list_chunk_ids_by_parent(self, parent_id: str) -> List[str]:
+        if not isinstance(self.search_info.credential, AzureKeyCredential):
+            raise TypeError("Transcript deletion currently requires an AzureKeyCredential.")
+
+        endpoint = self.search_info.endpoint.rstrip("/")
+        url = (
+            f"{endpoint}/indexes/{self.search_info.index_name}/docs/search"
+            "?api-version=2024-07-01"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.search_info.credential.key,
+        }
+
+        chunk_ids: List[str] = []
+        skip = 0
+        page_size = 1000
+        safe_parent_id = parent_id.replace("'", "''")
+        while True:
+            payload = {
+                "search": "*",
+                "filter": f"parent_id eq '{safe_parent_id}'",
+                "select": "chunk_id",
+                "top": page_size,
+                "skip": skip,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    data=json.dumps(payload).encode("utf-8"),
+                ) as response:
+                    if response.status >= 400:
+                        raise RuntimeError(
+                            "Failed to list transcript chunks from Azure Search: "
+                            f"{response.status} {await response.text()}"
+                        )
+                    body = await response.json()
+
+            page_ids = [item["chunk_id"] for item in body.get("value", []) if item.get("chunk_id")]
+            chunk_ids.extend(page_ids)
+            if len(page_ids) < page_size:
+                break
+            skip += page_size
+
+        return chunk_ids
+
+    async def delete_transcript_chunks(self, parent_id: str) -> int:
+        chunk_ids = await self.list_chunk_ids_by_parent(parent_id)
+        if not chunk_ids:
+            return 0
+
+        endpoint = self.search_info.endpoint.rstrip("/")
+        url = (
+            f"{endpoint}/indexes/{self.search_info.index_name}/docs/index"
+            "?api-version=2024-07-01"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.search_info.credential.key,
+        }
+
+        batch_size = 500
+        async with aiohttp.ClientSession() as session:
+            for start in range(0, len(chunk_ids), batch_size):
+                batch = chunk_ids[start : start + batch_size]
+                payload = {
+                    "value": [
+                        {
+                            "@search.action": "delete",
+                            "chunk_id": chunk_id,
+                        }
+                        for chunk_id in batch
+                    ]
+                }
+                async with session.post(
+                    url,
+                    headers=headers,
+                    data=json.dumps(payload).encode("utf-8"),
+                ) as response:
+                    if response.status >= 400:
+                        raise RuntimeError(
+                            "Failed to delete transcript chunks from Azure Search: "
+                            f"{response.status} {await response.text()}"
+                        )
+        return len(chunk_ids)
+
+    async def upload_transcript_chunks(
+        self,
+        transcript_chunks: List[Dict[str, object]],
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ):
         if not transcript_chunks:
             return []
 
@@ -434,4 +553,6 @@ class SearchManager:
                             "Failed to upload transcript chunk batch to Azure Search: "
                             f"{first_error.get('errorMessage', 'unknown error')}"
                         )
+                if progress_callback is not None:
+                    progress_callback(len(batch))
         return transcript_chunks
