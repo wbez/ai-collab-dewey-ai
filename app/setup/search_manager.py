@@ -31,7 +31,6 @@ from azure.search.documents.indexes.models import (
     SemanticPrioritizedFields,
     SemanticSearch,
     SimpleField,
-    SplitSkill,
     VectorSearch,
     VectorSearchProfile,
     VectorSearchVectorizer,
@@ -274,18 +273,26 @@ class SearchManager:
     async def create_index_skills(self):
         skillset_name = f"{self.search_info.index_name}-skillset"
 
-        split_skill = SplitSkill(
-            name=f"{self.search_info.index_name}-split-skill",
-            description="Split article documents into chunks",
-            text_split_mode="pages",
-            context="/document",
-            maximum_page_length=512,
-            page_overlap_length=96,
-            maximum_pages_to_take=0,
-            unit="azureOpenAITokens",
-            inputs=[InputFieldMappingEntry(name="text", source="/document/content")],
-            outputs=[OutputFieldMappingEntry(name="textItems", target_name="pages")],
-        )
+        split_skill_payload = {
+            "@odata.type": "#Microsoft.Skills.Text.SplitSkill",
+            "name": f"{self.search_info.index_name}-split-skill",
+            "description": "Split article documents into chunks",
+            "textSplitMode": "pages",
+            "context": "/document",
+            "maximumPageLength": 512,
+            "pageOverlapLength": 96,
+            "maximumPagesToTake": 0,
+            "unit": "azureOpenAITokens",
+            "azureOpenAITokenizerParameters": {
+                "encoderModelName": "cl100k_base",
+            },
+            "inputs": [
+                {"name": "text", "source": "/document/content"},
+            ],
+            "outputs": [
+                {"name": "textItems", "targetName": "pages"},
+            ],
+        }
 
         text_embedding_skill = AzureOpenAIEmbeddingSkill(
             name=f"{self.search_info.index_name}-text-embedding-skill",
@@ -332,12 +339,40 @@ class SearchManager:
             ),
         )
 
-        return SearchIndexerSkillset(
+        skillset = SearchIndexerSkillset(
             name=skillset_name,
             description="Skillset to process article documents and generate embeddings",
-            skills=[split_skill, text_embedding_skill],
+            skills=[text_embedding_skill],
             index_projection=index_projection,
         )
+        payload = skillset.serialize()
+        payload["skills"].insert(0, split_skill_payload)
+        return payload
+
+    async def create_or_update_preview_skillset(self, skillset_payload: dict):
+        skillset_name = skillset_payload["name"]
+        url = f"{self.search_info.endpoint.rstrip('/')}/skillsets/{skillset_name}?api-version=2024-09-01-preview"
+
+        if not isinstance(self.search_info.credential, AzureKeyCredential):
+            raise TypeError("Preview skillset update currently requires an AzureKeyCredential.")
+
+        headers = {
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+            "api-key": self.search_info.credential.key,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.put(
+                url,
+                headers=headers,
+                data=json.dumps(skillset_payload).encode("utf-8"),
+            ) as response:
+                if response.status >= 400:
+                    raise RuntimeError(
+                        f"Failed to create or update preview skillset {skillset_name}: "
+                        f"{response.status} {await response.text()}"
+                    )
 
     async def create_indexer(self, skillset_name: str, data_source_name: str):
         indexer_name = f"{self.search_info.index_name}-indexer"
@@ -378,11 +413,11 @@ class SearchManager:
             data_source, data_source_name = await self.create_blob_data_source()
             await ds_client.create_or_update_data_source_connection(data_source)
 
-            embedding_skillset = await self.create_index_skills()
-            await ds_client.create_or_update_skillset(embedding_skillset)
+            skillset_payload = await self.create_index_skills()
+            await self.create_or_update_preview_skillset(skillset_payload)
 
             indexer, indexer_name = await self.create_indexer(
-                embedding_skillset.name,
+                skillset_payload["name"],
                 data_source_name,
             )
             await ds_client.create_or_update_indexer(indexer)
