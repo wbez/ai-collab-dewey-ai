@@ -110,8 +110,7 @@ def test_build_filter_normalizes_and_escapes_author_names():
     }
 
     assert dewey.build_filter(metadata) == (
-        "authors/any(a: tolower(a) eq 'maureen o''connor' or "
-        "tolower(a) eq 'will bunch')"
+        "authors/any(a: a eq 'Maureen O''Connor' or a eq 'WILL BUNCH')"
     )
 
 
@@ -132,8 +131,8 @@ def test_build_filter_supports_transcript_fields():
         "publish_date le 2024-12-31T23:59:59Z and "
         "(content_type eq 'transcript') and "
         "program eq 'Radio Times' and "
-        "guests/any(a: tolower(a) eq 'jane guest') and "
-        "speakers/any(a: tolower(a) eq 'john doe')"
+        "guests/any(a: a eq 'Jane Guest') and "
+        "speakers/any(a: a eq 'John Doe')"
     )
 
 

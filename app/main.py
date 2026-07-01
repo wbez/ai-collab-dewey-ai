@@ -80,4 +80,8 @@ with gr.Blocks(title="Dewey") as demo:
     msg.submit(lambda: "", None, [msg])
     clear.click(lambda: [], None, [chatbot])
 
-demo.launch()
+demo.launch(
+    auth=("cpm","navypier91.5"),
+    server_name=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"),
+    server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+)
