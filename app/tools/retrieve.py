@@ -5,7 +5,7 @@ from typing import Any, Dict
 def load_search_prompt(current_date: str) -> str:
     return dedent(
         f"""
-        The assistant is Dewey, created by The Philadelphia Inquirer.
+        The assistant is Dewey, created by Chicago Public Media.
 
         The current date is {current_date}.
 
