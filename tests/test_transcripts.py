@@ -101,3 +101,10 @@ def test_build_transcript_chunks_merges_short_turns(tmp_path):
     assert "Transcript excerpt:" in chunks[0]["search_text"]
     assert document["id"] == "22563"
     assert document["transcript_name"] == "episode.vtt"
+    assert document["extra_metadata"]["recording_files"] == [
+        {
+            "source_url": "https://example.com/audio.mp3",
+            "length": 120.0,
+            "size": "1024",
+        }
+    ]

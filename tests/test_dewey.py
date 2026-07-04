@@ -209,7 +209,146 @@ def test_retrieve_articles_formats_transcript_sources():
     sources = dewey.retrieve_articles(metadata)
 
     payload = MODULE.json.loads(sources[0])
-    assert payload["content_type"] == "transcript"
-    assert payload["transcript_url"] == "https://example.com/transcript"
-    assert payload["recording_urls"] == ["https://example.com/audio.mp3"]
-    assert payload["timestamp_label"] == "00:00:01.000 - 00:00:07.000"
+    assert payload == {
+        "content_type": "transcript",
+        "publish_date": "2026-01-02",
+        "speakers": ["Host", "Guest"],
+        "start_time": "00:00:01.000",
+        "end_time": "00:00:07.000",
+        "content": "Transcript body",
+    }
+
+
+def test_retrieve_articles_formats_article_sources():
+    article_page = {
+        "url": "https://example.com/story",
+        "publish_date": "2026-01-02T12:00:00Z",
+        "authors": ["Reema Saleh"],
+        "headline": "Story",
+        "content": "Article body",
+        "content_type": "article",
+    }
+    dewey = make_dewey([[article_page]])
+
+    metadata = {
+        "question": "What changed?",
+        "date_range": {"start_date": None, "end_date": None},
+        "authors": [],
+        "speakers": [],
+        "guests": [],
+        "content_types": ["article"],
+        "program": None,
+    }
+
+    sources = dewey.retrieve_articles(metadata)
+
+    payload = MODULE.json.loads(sources[0])
+    assert payload == {
+        "content_type": "article",
+        "publish_date": "2026-01-02",
+        "authors": ["Reema Saleh"],
+        "headline": "Story",
+        "content": "Article body",
+    }
+
+
+def test_build_source_url_map_prefers_transcript_url_for_transcripts():
+    dewey = make_dewey([])
+
+    results = [
+        {
+            "content_type": "transcript",
+            "url": "https://example.com/audio.mp3",
+            "transcript_url": "https://example.com/transcript",
+            "recording_urls": ["https://example.com/audio.mp3"],
+        }
+    ]
+
+    assert dewey._build_source_url_map(results) == {1: "https://example.com/transcript"}
+
+
+def test_build_source_url_map_falls_back_to_recording_url_for_transcripts():
+    dewey = make_dewey([])
+
+    results = [
+        {
+            "content_type": "transcript",
+            "url": None,
+            "transcript_url": None,
+            "recording_urls": ["https://example.com/audio.mp3"],
+        }
+    ]
+
+    assert dewey._build_source_url_map(results) == {1: "https://example.com/audio.mp3"}
+
+
+def test_build_source_url_map_uses_timestamped_recording_link_for_single_audio_file():
+    dewey = make_dewey([])
+
+    results = [
+        {
+            "content_type": "transcript",
+            "url": "https://example.com/audio.mp3",
+            "transcript_url": None,
+            "recording_urls": ["https://example.com/audio.mp3"],
+            "start_seconds": 91.8,
+            "raw_metadata_json": None,
+        }
+    ]
+
+    assert dewey._build_source_url_map(results) == {1: "https://example.com/audio.mp3#t=91"}
+
+
+def test_build_source_url_map_uses_matching_recording_file_and_local_offset():
+    dewey = make_dewey([])
+
+    results = [
+        {
+            "content_type": "transcript",
+            "url": "https://example.com/part-1.mp3",
+            "transcript_url": None,
+            "recording_urls": [
+                "https://example.com/part-1.mp3",
+                "https://example.com/part-2.mp3",
+                "https://example.com/part-3.mp3",
+            ],
+            "start_seconds": 3669.07,
+            "raw_metadata_json": MODULE.json.dumps(
+                {
+                    "files": [
+                        {"source_url": "https://example.com/part-1.mp3", "length": 1800.0},
+                        {"source_url": "https://example.com/part-2.mp3", "length": 1800.0},
+                        {"source_url": "https://example.com/part-3.mp3", "length": 900.0},
+                    ]
+                }
+            ),
+        }
+    ]
+
+    assert dewey._build_source_url_map(results) == {1: "https://example.com/part-3.mp3#t=69"}
+
+
+def test_replace_source_markers_renders_clickable_citation_links():
+    dewey = make_dewey([])
+
+    rendered = dewey._replace_source_markers(
+        "Transcript match [SRC1] and article match [SRC2].",
+        {
+            1: "https://example.com/transcript",
+            2: "https://example.com/story",
+        },
+    )
+
+    assert rendered == (
+        'Transcript match <a href="https://example.com/transcript" target="_blank" '
+        'rel="noopener noreferrer">[1]</a> and article match '
+        '<a href="https://example.com/story" target="_blank" rel="noopener noreferrer">[2]</a>.'
+    )
+
+
+def test_replace_source_markers_leaves_plain_label_without_url():
+    dewey = make_dewey([])
+
+    rendered = dewey._replace_source_markers("No link [SRC1].", {1: None})
+
+    assert rendered == "No link [1]."

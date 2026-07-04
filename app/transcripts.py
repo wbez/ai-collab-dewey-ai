@@ -211,12 +211,21 @@ def load_transcript_document(vtt_path: Path, metadata_path: Path) -> Dict[str, A
     recording_urls = merged_metadata.get("recording_urls") or []
     if isinstance(recording_urls, str):
         recording_urls = [recording_urls]
+    recording_file_metadata: List[Dict[str, Any]] = []
     normalized_recording_urls: List[str] = []
     for value in recording_urls:
         if isinstance(value, dict):
             url = value.get("url")
             if url:
                 normalized_recording_urls.append(str(url))
+                recording_file: Dict[str, Any] = {"source_url": str(url)}
+                length = value.get("length")
+                if isinstance(length, (int, float)):
+                    recording_file["length"] = float(length)
+                size = value.get("size")
+                if size is not None:
+                    recording_file["size"] = size
+                recording_file_metadata.append(recording_file)
         elif value:
             normalized_recording_urls.append(str(value))
     if not normalized_recording_urls and merged_metadata.get("source_url"):
@@ -228,6 +237,8 @@ def load_transcript_document(vtt_path: Path, metadata_path: Path) -> Dict[str, A
             if key.startswith("source_url[") and value
         ]
         normalized_recording_urls = [str(value) for value in source_urls]
+    if recording_file_metadata:
+        extra_metadata["recording_files"] = recording_file_metadata
 
     guests = merged_metadata.get("guests") or []
     if isinstance(guests, str):

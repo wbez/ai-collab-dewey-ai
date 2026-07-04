@@ -1,3 +1,4 @@
+import html
 import json
 import re
 from contextlib import contextmanager
@@ -13,7 +14,7 @@ from openai import AzureOpenAI
 from models import AzureOpenAIConfig, AzureSearchConfig
 from tips import TipFormatter
 from tools import load_answer_prompt, load_search_prompt, load_search_tool
-from transcripts import normalize_name
+from transcripts import format_timestamp, normalize_name
 
 
 LUCENE_RESERVED_PATTERN = re.compile(r'([+\-&|!(){}\[\]^"~*?:\\/])')
@@ -186,6 +187,7 @@ class Dewey:
                 "guests",
                 "program",
                 "chunk_id",
+                "raw_metadata_json",
             ],
         }
         if vector_queries:
@@ -275,27 +277,136 @@ class Dewey:
             publish_date = page.get("publish_date")
             source_payload = {
                 "content_type": page.get("content_type", "article"),
-                "url": page.get("url"),
-                "transcript_url": page.get("transcript_url"),
-                "recording_urls": page.get("recording_urls") or [],
                 "publish_date": (
                     parse(publish_date).date().isoformat() if publish_date else None
                 ),
-                "authors": page.get("authors") or [],
-                "speakers": page.get("speakers") or [],
-                "guests": page.get("guests") or [],
-                "program": page.get("program"),
-                "headline": page.get("headline"),
-                "chunk_id": page.get("chunk_id"),
-                "timestamp_label": page.get("timestamp_label"),
-                "start_seconds": page.get("start_seconds"),
-                "end_seconds": page.get("end_seconds"),
                 "content": (page.get("content") or "").replace("\n", " ").replace("\r", " "),
             }
+            if source_payload["content_type"] == "transcript":
+                speakers = page.get("speakers") or []
+                if speakers:
+                    source_payload["speakers"] = speakers
+                start_seconds = page.get("start_seconds")
+                if isinstance(start_seconds, (int, float)):
+                    source_payload["start_time"] = format_timestamp(float(start_seconds))
+                end_seconds = page.get("end_seconds")
+                if isinstance(end_seconds, (int, float)):
+                    source_payload["end_time"] = format_timestamp(float(end_seconds))
+            else:
+                authors = page.get("authors") or []
+                if authors:
+                    source_payload["authors"] = authors
+                headline = page.get("headline")
+                if headline:
+                    source_payload["headline"] = headline
             sources.append(json.dumps(source_payload))
         return sources
 
-    def retrieve_articles(self, metadata):
+    def _append_timestamp_fragment(self, url: str, seconds: float) -> str:
+        separator = "&" if "#" in url else "#"
+        return f"{url}{separator}t={int(seconds)}"
+
+    def _extract_recording_file_entries(self, source_data: Dict[str, object]) -> List[Dict[str, object]]:
+        raw_metadata_json = source_data.get("raw_metadata_json")
+        if not raw_metadata_json:
+            return []
+
+        try:
+            raw_metadata = json.loads(str(raw_metadata_json))
+        except (TypeError, ValueError):
+            return []
+
+        candidate_groups = [
+            raw_metadata.get("recording_files"),
+            raw_metadata.get("files"),
+        ]
+        files: List[Dict[str, object]] = []
+        for group in candidate_groups:
+            if not isinstance(group, list):
+                continue
+            for entry in group:
+                if not isinstance(entry, dict):
+                    continue
+                source_url = entry.get("source_url") or entry.get("url")
+                length = entry.get("length") or entry.get("duration")
+                if not source_url or not isinstance(length, (int, float)):
+                    continue
+                files.append(
+                    {
+                        "source_url": str(source_url),
+                        "length": float(length),
+                    }
+                )
+            if files:
+                return files
+        return files
+
+    def _resolve_recording_url(self, source_data: Dict[str, object]) -> Optional[str]:
+        recording_urls = source_data.get("recording_urls") or []
+        if not isinstance(recording_urls, list) or not recording_urls:
+            return None
+
+        start_seconds = source_data.get("start_seconds")
+        if isinstance(start_seconds, (int, float)):
+            recording_files = self._extract_recording_file_entries(source_data)
+            if recording_files:
+                elapsed = float(start_seconds)
+                for entry in recording_files:
+                    length = float(entry["length"])
+                    if elapsed < length:
+                        return self._append_timestamp_fragment(str(entry["source_url"]), elapsed)
+                    elapsed -= length
+                last_entry = recording_files[-1]
+                return self._append_timestamp_fragment(str(last_entry["source_url"]), max(elapsed, 0.0))
+
+            if len(recording_urls) == 1 and recording_urls[0]:
+                return self._append_timestamp_fragment(str(recording_urls[0]), float(start_seconds))
+
+        for value in recording_urls:
+            if value:
+                return str(value)
+        return None
+
+    def _resolve_source_url(self, source_data: Dict[str, object]) -> Optional[str]:
+        transcript_url = source_data.get("transcript_url")
+        if transcript_url:
+            return str(transcript_url)
+
+        recording_url = self._resolve_recording_url(source_data)
+        if recording_url:
+            return recording_url
+
+        url = source_data.get("url")
+        if url:
+            return str(url)
+        return None
+
+    def _build_source_url_map(self, results) -> Dict[int, Optional[str]]:
+        source_urls: Dict[int, Optional[str]] = {}
+        for i, page in enumerate(results, 1):
+            source_urls[i] = self._resolve_source_url(page)
+        return source_urls
+
+    def _format_source_reference(self, source_number: int, source_url: Optional[str]) -> str:
+        label = f"[{source_number}]"
+        if not source_url:
+            return label
+        escaped_url = html.escape(source_url, quote=True)
+        return (
+            f'<a href="{escaped_url}" target="_blank" rel="noopener noreferrer">{label}</a>'
+        )
+
+    def _replace_source_markers(self, text: str, source_urls: Dict[int, Optional[str]]) -> str:
+        return re.sub(
+            r"\[SRC(\d+)\]",
+            lambda match: self._format_source_reference(
+                int(match.group(1)),
+                source_urls.get(int(match.group(1))),
+            ),
+            text,
+        )
+
+    def _retrieve_documents(self, metadata):
         vectors = self._build_vector_query(metadata)
         exact_filter = self.build_filter(metadata, include_exact_names=True)
         results = self._search_documents(
@@ -330,7 +441,10 @@ class Dewey:
                 vector_queries=None,
             )
 
-        return self._format_sources(results)
+        return results
+
+    def retrieve_articles(self, metadata):
+        return self._format_sources(self._retrieve_documents(metadata))
 
     def process(self, message: str, history: List, show_steps: bool = True):
         self._current_steps = []
@@ -350,7 +464,8 @@ class Dewey:
         with self.step("Searching articles", show_steps) as step:
             if result := step.start("🔍 Digging through the archives"):
                 yield result
-            sources = self.retrieve_articles(metadata)
+            results = self._retrieve_documents(metadata)
+            sources = self._format_sources(results)
             sources_tip = self.tip_formatter.tip_search(sources)
             if result := step.complete(sources_tip):
                 yield result
@@ -358,10 +473,7 @@ class Dewey:
         stacked_sources = "\n\n".join(sources)
         messages.append({"role": "user", "content": f"{message}\n\n## Sources\n{stacked_sources}"})
 
-        source_urls = {}
-        for i, source_json in enumerate(sources, 1):
-            source_data = json.loads(source_json)
-            source_urls[i] = source_data.get("transcript_url") or source_data.get("url")
+        source_urls = self._build_source_url_map(results)
 
         response = self.oai_client.responses.create(
             model=self.openai_config.chat_deployment,
@@ -374,9 +486,5 @@ class Dewey:
         for chunk in response:
             if chunk.type == "response.output_text.delta" and chunk.delta:
                 partial += chunk.delta
-                processed_partial = re.sub(
-                    r"\[SRC(\d+)\]",
-                    lambda match: f"[[{match.group(1)}]]({source_urls.get(int(match.group(1)), '#')})",
-                    partial,
-                )
+                processed_partial = self._replace_source_markers(partial, source_urls)
                 yield processed_partial, self._current_steps.copy()
