@@ -143,16 +143,16 @@ class Dewey:
 
     def _build_name_filter(self, field_name: str, values: object) -> Optional[str]:
         names = [self._coerce_entity_name(value) for value in values or []]
-        normalized_names = []
+        exact_names = []
         for name in names:
             compact = re.sub(r"\s+", " ", name).strip()
             if compact:
-                normalized_names.append(self._escape_odata_string(compact.lower()))
+                exact_names.append(self._escape_odata_string(compact))
 
-        if not normalized_names:
+        if not exact_names:
             return None
 
-        clauses = [f"tolower(a) eq '{name}'" for name in normalized_names]
+        clauses = [f"a eq '{name}'" for name in exact_names]
         return f"{field_name}/any(a: {' or '.join(clauses)})"
 
     def _search_documents(
