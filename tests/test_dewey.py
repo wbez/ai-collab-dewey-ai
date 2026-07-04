@@ -178,7 +178,7 @@ def test_retrieve_articles_uses_fuzzy_fallback_for_author_queries():
 
 def test_retrieve_articles_formats_transcript_sources():
     transcript_page = {
-        "url": "https://example.com/transcript",
+        "citation_url": "https://example.com/audio.mp3#t=1",
         "transcript_url": "https://example.com/transcript",
         "recording_urls": ["https://example.com/audio.mp3"],
         "publish_date": "2026-01-02T12:00:00Z",
@@ -186,11 +186,10 @@ def test_retrieve_articles_formats_transcript_sources():
         "speakers": ["Host", "Guest"],
         "guests": ["Guest"],
         "program": "Radio Times",
-        "headline": "Episode Title",
-        "content": "Transcript body",
+        "title": "Episode Title",
+        "chunk_text": "Transcript body",
         "content_type": "transcript",
         "chunk_id": "chunk-1",
-        "timestamp_label": "00:00:01.000 - 00:00:07.000",
         "start_seconds": 1.0,
         "end_seconds": 7.0,
     }
@@ -258,13 +257,31 @@ def test_build_source_url_map_prefers_transcript_url_for_transcripts():
     results = [
         {
             "content_type": "transcript",
-            "url": "https://example.com/audio.mp3",
             "transcript_url": "https://example.com/transcript",
             "recording_urls": ["https://example.com/audio.mp3"],
         }
     ]
 
     assert dewey._build_source_url_map(results) == {1: "https://example.com/transcript"}
+
+
+def test_build_source_url_map_prefers_citation_url_for_transcripts():
+    dewey = make_dewey([])
+
+    results = [
+        {
+            "content_type": "transcript",
+            "citation_url": "https://example.com/part-3.mp3#t=69",
+            "transcript_url": "https://example.com/transcript",
+            "recording_urls": [
+                "https://example.com/part-1.mp3",
+                "https://example.com/part-2.mp3",
+                "https://example.com/part-3.mp3",
+            ],
+        }
+    ]
+
+    assert dewey._build_source_url_map(results) == {1: "https://example.com/part-3.mp3#t=69"}
 
 
 def test_build_source_url_map_falls_back_to_recording_url_for_transcripts():
@@ -280,52 +297,6 @@ def test_build_source_url_map_falls_back_to_recording_url_for_transcripts():
     ]
 
     assert dewey._build_source_url_map(results) == {1: "https://example.com/audio.mp3"}
-
-
-def test_build_source_url_map_uses_timestamped_recording_link_for_single_audio_file():
-    dewey = make_dewey([])
-
-    results = [
-        {
-            "content_type": "transcript",
-            "url": "https://example.com/audio.mp3",
-            "transcript_url": None,
-            "recording_urls": ["https://example.com/audio.mp3"],
-            "start_seconds": 91.8,
-            "raw_metadata_json": None,
-        }
-    ]
-
-    assert dewey._build_source_url_map(results) == {1: "https://example.com/audio.mp3#t=91"}
-
-
-def test_build_source_url_map_uses_matching_recording_file_and_local_offset():
-    dewey = make_dewey([])
-
-    results = [
-        {
-            "content_type": "transcript",
-            "url": "https://example.com/part-1.mp3",
-            "transcript_url": None,
-            "recording_urls": [
-                "https://example.com/part-1.mp3",
-                "https://example.com/part-2.mp3",
-                "https://example.com/part-3.mp3",
-            ],
-            "start_seconds": 3669.07,
-            "raw_metadata_json": MODULE.json.dumps(
-                {
-                    "files": [
-                        {"source_url": "https://example.com/part-1.mp3", "length": 1800.0},
-                        {"source_url": "https://example.com/part-2.mp3", "length": 1800.0},
-                        {"source_url": "https://example.com/part-3.mp3", "length": 900.0},
-                    ]
-                }
-            ),
-        }
-    ]
-
-    assert dewey._build_source_url_map(results) == {1: "https://example.com/part-3.mp3#t=69"}
 
 
 def test_replace_source_markers_renders_clickable_citation_links():

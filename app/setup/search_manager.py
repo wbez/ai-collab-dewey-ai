@@ -82,8 +82,10 @@ class SearchManager:
                         analyzer_name="keyword",
                     ),
                     SearchableField(name="content", type="Edm.String", analyzer_name="standard.lucene"),
+                    SearchableField(name="chunk_text", type="Edm.String", analyzer_name="standard.lucene"),
                     SearchableField(name="search_text", type="Edm.String", analyzer_name="standard.lucene"),
                     SearchableField(name="headline", type="Edm.String", analyzer_name="standard.lucene"),
+                    SearchableField(name="title", type="Edm.String", analyzer_name="standard.lucene"),
                     SearchableField(name="description", type="Edm.String", analyzer_name="standard.lucene"),
                     SearchableField(
                         name="author_search_text",
@@ -168,13 +170,21 @@ class SearchManager:
                         facetable=True,
                         retrievable=True,
                     ),
+                    SimpleField(
+                        name="occurrence_id",
+                        type="Edm.String",
+                        filterable=True,
+                        facetable=True,
+                        retrievable=True,
+                    ),
+                    SimpleField(name="transcript_name", type="Edm.String", retrievable=True),
                     SimpleField(name="transcript_url", type="Edm.String", retrievable=True),
+                    SimpleField(name="citation_url", type="Edm.String", retrievable=True),
                     SimpleField(
                         name="recording_urls",
                         type="Collection(Edm.String)",
                         retrievable=True,
                     ),
-                    SimpleField(name="timestamp_label", type="Edm.String", retrievable=True),
                     SimpleField(
                         name="start_seconds",
                         type="Edm.Double",
@@ -189,7 +199,6 @@ class SearchManager:
                         sortable=True,
                         retrievable=True,
                     ),
-                    SimpleField(name="raw_metadata_json", type="Edm.String", retrievable=True),
                 ]
 
                 vectorizers = vectorizers or [
@@ -216,6 +225,7 @@ class SearchManager:
                                     content_fields=[
                                         SemanticField(field_name="search_text"),
                                         SemanticField(field_name="content"),
+                                        SemanticField(field_name="chunk_text"),
                                         SemanticField(field_name="description"),
                                     ],
                                     keywords_fields=[

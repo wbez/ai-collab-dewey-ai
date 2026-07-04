@@ -2,8 +2,10 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from os.path import basename
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import unquote, urlparse
 
 try:
     import tiktoken
@@ -64,6 +66,11 @@ def format_timestamp(seconds: float) -> str:
     minutes, remainder = divmod(remainder, 60_000)
     secs, millis = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def append_timestamp_fragment(url: str, seconds: float) -> str:
+    separator = "&" if "#" in url else "#"
+    return f"{url}{separator}t={int(seconds)}"
 
 
 def count_tokens(value: str) -> int:
@@ -158,6 +165,87 @@ def parse_note_file_entry(value: str) -> Dict[str, Any]:
     return parsed
 
 
+def extract_filename_from_url(url: str) -> str:
+    return unquote(basename(urlparse(url).path))
+
+
+def normalize_recording_files(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    recording_urls = metadata.get("recording_urls") or []
+    if isinstance(recording_urls, str):
+        recording_urls = [recording_urls]
+
+    normalized_files: List[Dict[str, Any]] = []
+    for value in recording_urls:
+        if isinstance(value, dict):
+            url = value.get("url")
+            if not url:
+                continue
+            normalized_file: Dict[str, Any] = {
+                "url": str(url),
+                "filename": extract_filename_from_url(str(url)),
+            }
+            length = value.get("length")
+            if isinstance(length, (int, float)):
+                normalized_file["length_seconds"] = float(length)
+            size = value.get("size")
+            if size is not None:
+                try:
+                    normalized_file["size_bytes"] = int(size)
+                except (TypeError, ValueError):
+                    pass
+            normalized_files.append(normalized_file)
+        elif value:
+            url = str(value)
+            normalized_files.append(
+                {
+                    "url": url,
+                    "filename": extract_filename_from_url(url),
+                }
+            )
+
+    if normalized_files:
+        return normalized_files
+
+    source_urls = []
+    if metadata.get("source_url"):
+        source_urls.append(metadata["source_url"])
+    source_urls.extend(
+        value
+        for key, value in metadata.items()
+        if key.startswith("source_url[") and value
+    )
+    return [
+        {
+            "url": str(url),
+            "filename": extract_filename_from_url(str(url)),
+        }
+        for url in source_urls
+    ]
+
+
+def build_citation_url(recording_files: List[Dict[str, Any]], start_seconds: float) -> Optional[str]:
+    if not recording_files:
+        return None
+
+    elapsed = float(start_seconds)
+    for recording_file in recording_files:
+        url = recording_file.get("url")
+        if not url:
+            continue
+        length_seconds = recording_file.get("length_seconds")
+        if isinstance(length_seconds, (int, float)):
+            if elapsed < float(length_seconds):
+                return append_timestamp_fragment(str(url), elapsed)
+            elapsed -= float(length_seconds)
+            continue
+        return append_timestamp_fragment(str(url), elapsed)
+
+    last_url = recording_files[-1].get("url")
+    if last_url:
+        return append_timestamp_fragment(str(last_url), max(elapsed, 0.0))
+    return None
+
+
 def build_name_search_text(names: Iterable[str]) -> str:
     tokens: List[str] = []
     for name in names:
@@ -172,7 +260,7 @@ def build_name_search_text(names: Iterable[str]) -> str:
 
 
 def build_transcript_search_text(
-    headline: str,
+    title: str,
     description: Optional[str],
     program: Optional[str],
     guests: List[str],
@@ -180,7 +268,7 @@ def build_transcript_search_text(
     content: str,
 ) -> str:
     blocks = [
-        f"Title: {headline}" if headline else "",
+        f"Title: {title}" if title else "",
         f"Description: {description}" if description else "",
         f"Program: {program}" if program else "",
         f"Guests: {'; '.join(guests)}" if guests else "",
@@ -198,47 +286,8 @@ def load_transcript_document(vtt_path: Path, metadata_path: Path) -> Dict[str, A
     merged_metadata.update(_metadata_from_notes(notes))
     merged_metadata.update(metadata)
 
-    extra_metadata = {
-        key: value
-        for key, value in merged_metadata.items()
-        if key not in KNOWN_TRANSCRIPT_FIELDS
-    }
-    if merged_metadata.get("collective_access_metadata"):
-        extra_metadata["collective_access_metadata"] = merged_metadata["collective_access_metadata"]
-    if notes:
-        extra_metadata.setdefault("vtt_notes", notes)
-
-    recording_urls = merged_metadata.get("recording_urls") or []
-    if isinstance(recording_urls, str):
-        recording_urls = [recording_urls]
-    recording_file_metadata: List[Dict[str, Any]] = []
-    normalized_recording_urls: List[str] = []
-    for value in recording_urls:
-        if isinstance(value, dict):
-            url = value.get("url")
-            if url:
-                normalized_recording_urls.append(str(url))
-                recording_file: Dict[str, Any] = {"source_url": str(url)}
-                length = value.get("length")
-                if isinstance(length, (int, float)):
-                    recording_file["length"] = float(length)
-                size = value.get("size")
-                if size is not None:
-                    recording_file["size"] = size
-                recording_file_metadata.append(recording_file)
-        elif value:
-            normalized_recording_urls.append(str(value))
-    if not normalized_recording_urls and merged_metadata.get("source_url"):
-        normalized_recording_urls = [merged_metadata["source_url"]]
-    if not normalized_recording_urls:
-        source_urls = [
-            value
-            for key, value in merged_metadata.items()
-            if key.startswith("source_url[") and value
-        ]
-        normalized_recording_urls = [str(value) for value in source_urls]
-    if recording_file_metadata:
-        extra_metadata["recording_files"] = recording_file_metadata
+    recording_files = normalize_recording_files(merged_metadata)
+    recording_urls = [recording_file["url"] for recording_file in recording_files if recording_file.get("url")]
 
     guests = merged_metadata.get("guests") or []
     if isinstance(guests, str):
@@ -274,11 +323,17 @@ def load_transcript_document(vtt_path: Path, metadata_path: Path) -> Dict[str, A
         "description": merged_metadata.get("description"),
         "program": merged_metadata.get("program"),
         "recording_date": recording_date,
+        "occurrence_id": str(
+            collective_access_metadata.get("occurrence_id")
+            or merged_metadata.get("occurrence_id")
+            or ""
+        )
+        or None,
         "transcript_url": transcript_url,
         "transcript_name": merged_metadata.get("transcript_name") or vtt_path.name,
-        "recording_urls": normalized_recording_urls,
+        "recording_urls": recording_urls,
+        "recording_files": recording_files,
         "guests": [normalize_whitespace(guest) for guest in guests if normalize_whitespace(guest)],
-        "extra_metadata": extra_metadata,
         "cues": cues,
     }
 
@@ -306,7 +361,7 @@ def build_transcript_chunks(document: Dict[str, Any]) -> List[Dict[str, Any]]:
     for index, chunk in enumerate(chunks):
         speakers = [speaker for speaker in chunk["speakers"] if speaker]
         search_text = build_transcript_search_text(
-            headline=document["title"],
+            title=document["title"],
             description=document.get("description"),
             program=document.get("program"),
             guests=document.get("guests", []),
@@ -322,8 +377,9 @@ def build_transcript_chunks(document: Dict[str, Any]) -> List[Dict[str, Any]]:
             {
                 "chunk_id": f"{document['id']}-{index:04d}-{fingerprint}",
                 "parent_id": document["id"],
+                "occurrence_id": document.get("occurrence_id"),
                 "content_type": "transcript",
-                "headline": document["title"],
+                "title": document["title"],
                 "description": document.get("description"),
                 "program": document.get("program"),
                 "guests": document.get("guests", []),
@@ -331,16 +387,18 @@ def build_transcript_chunks(document: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "speaker_search_text": build_name_search_text(speakers),
                 "author_search_text": "",
                 "transcript_url": document["transcript_url"],
+                "transcript_name": document["transcript_name"],
+                "citation_url": build_citation_url(
+                    document.get("recording_files", []),
+                    chunk["start_seconds"],
+                ),
                 "recording_urls": document.get("recording_urls", []),
-                "timestamp_label": f"{format_timestamp(chunk['start_seconds'])} - {format_timestamp(chunk['end_seconds'])}",
                 "start_seconds": chunk["start_seconds"],
                 "end_seconds": chunk["end_seconds"],
                 "publish_date": document.get("recording_date"),
                 "recording_date": document.get("recording_date"),
-                "content": chunk["content"],
+                "chunk_text": chunk["content"],
                 "search_text": search_text,
-                "raw_metadata_json": json.dumps(document.get("extra_metadata", {}), ensure_ascii=False),
-                "url": document["transcript_url"] or (document.get("recording_urls") or [None])[0],
                 "authors": [],
             }
         )

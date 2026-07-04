@@ -91,20 +91,26 @@ def test_build_transcript_chunks_merges_short_turns(tmp_path):
 
     assert chunks
     assert chunks[0]["content_type"] == "transcript"
+    assert chunks[0]["occurrence_id"] == "1299"
+    assert chunks[0]["title"] == "episode.mp3"
     assert chunks[0]["transcript_url"] is None
+    assert chunks[0]["transcript_name"] == "episode.vtt"
+    assert chunks[0]["citation_url"] == "https://example.com/audio.mp3#t=1"
     assert chunks[0]["recording_urls"] == ["https://example.com/audio.mp3"]
-    assert chunks[0]["url"] == "https://example.com/audio.mp3"
+    assert chunks[0]["chunk_text"]
     assert "Host" in chunks[0]["speakers"]
     assert "Guest" in chunks[0]["speakers"]
     assert chunks[0]["program"] == "Radio Times"
     assert chunks[0]["speaker_search_text"]
     assert "Transcript excerpt:" in chunks[0]["search_text"]
     assert document["id"] == "22563"
+    assert document["occurrence_id"] == "1299"
     assert document["transcript_name"] == "episode.vtt"
-    assert document["extra_metadata"]["recording_files"] == [
+    assert document["recording_files"] == [
         {
-            "source_url": "https://example.com/audio.mp3",
-            "length": 120.0,
-            "size": "1024",
+            "url": "https://example.com/audio.mp3",
+            "filename": "audio.mp3",
+            "length_seconds": 120.0,
+            "size_bytes": 1024,
         }
     ]

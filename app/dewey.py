@@ -174,20 +174,23 @@ class Dewey:
             "select": [
                 "url",
                 "headline",
+                "title",
                 "publish_date",
                 "content",
+                "chunk_text",
                 "authors",
                 "content_type",
+                "citation_url",
+                "occurrence_id",
+                "transcript_name",
                 "transcript_url",
                 "recording_urls",
-                "timestamp_label",
                 "start_seconds",
                 "end_seconds",
                 "speakers",
                 "guests",
                 "program",
                 "chunk_id",
-                "raw_metadata_json",
             ],
         }
         if vector_queries:
@@ -275,12 +278,13 @@ class Dewey:
         sources = []
         for page in results:
             publish_date = page.get("publish_date")
+            content = page.get("chunk_text") if page.get("content_type") == "transcript" else page.get("content")
             source_payload = {
                 "content_type": page.get("content_type", "article"),
                 "publish_date": (
                     parse(publish_date).date().isoformat() if publish_date else None
                 ),
-                "content": (page.get("content") or "").replace("\n", " ").replace("\r", " "),
+                "content": (content or "").replace("\n", " ").replace("\r", " "),
             }
             if source_payload["content_type"] == "transcript":
                 speakers = page.get("speakers") or []
@@ -302,79 +306,19 @@ class Dewey:
             sources.append(json.dumps(source_payload))
         return sources
 
-    def _append_timestamp_fragment(self, url: str, seconds: float) -> str:
-        separator = "&" if "#" in url else "#"
-        return f"{url}{separator}t={int(seconds)}"
-
-    def _extract_recording_file_entries(self, source_data: Dict[str, object]) -> List[Dict[str, object]]:
-        raw_metadata_json = source_data.get("raw_metadata_json")
-        if not raw_metadata_json:
-            return []
-
-        try:
-            raw_metadata = json.loads(str(raw_metadata_json))
-        except (TypeError, ValueError):
-            return []
-
-        candidate_groups = [
-            raw_metadata.get("recording_files"),
-            raw_metadata.get("files"),
-        ]
-        files: List[Dict[str, object]] = []
-        for group in candidate_groups:
-            if not isinstance(group, list):
-                continue
-            for entry in group:
-                if not isinstance(entry, dict):
-                    continue
-                source_url = entry.get("source_url") or entry.get("url")
-                length = entry.get("length") or entry.get("duration")
-                if not source_url or not isinstance(length, (int, float)):
-                    continue
-                files.append(
-                    {
-                        "source_url": str(source_url),
-                        "length": float(length),
-                    }
-                )
-            if files:
-                return files
-        return files
-
-    def _resolve_recording_url(self, source_data: Dict[str, object]) -> Optional[str]:
-        recording_urls = source_data.get("recording_urls") or []
-        if not isinstance(recording_urls, list) or not recording_urls:
-            return None
-
-        start_seconds = source_data.get("start_seconds")
-        if isinstance(start_seconds, (int, float)):
-            recording_files = self._extract_recording_file_entries(source_data)
-            if recording_files:
-                elapsed = float(start_seconds)
-                for entry in recording_files:
-                    length = float(entry["length"])
-                    if elapsed < length:
-                        return self._append_timestamp_fragment(str(entry["source_url"]), elapsed)
-                    elapsed -= length
-                last_entry = recording_files[-1]
-                return self._append_timestamp_fragment(str(last_entry["source_url"]), max(elapsed, 0.0))
-
-            if len(recording_urls) == 1 and recording_urls[0]:
-                return self._append_timestamp_fragment(str(recording_urls[0]), float(start_seconds))
-
-        for value in recording_urls:
-            if value:
-                return str(value)
-        return None
-
     def _resolve_source_url(self, source_data: Dict[str, object]) -> Optional[str]:
+        citation_url = source_data.get("citation_url")
+        if citation_url:
+            return str(citation_url)
+
         transcript_url = source_data.get("transcript_url")
         if transcript_url:
             return str(transcript_url)
-
-        recording_url = self._resolve_recording_url(source_data)
-        if recording_url:
-            return recording_url
+        recording_urls = source_data.get("recording_urls") or []
+        if isinstance(recording_urls, list):
+            for value in recording_urls:
+                if value:
+                    return str(value)
 
         url = source_data.get("url")
         if url:
@@ -472,7 +416,6 @@ class Dewey:
 
         stacked_sources = "\n\n".join(sources)
         messages.append({"role": "user", "content": f"{message}\n\n## Sources\n{stacked_sources}"})
-
         source_urls = self._build_source_url_map(results)
 
         response = self.oai_client.responses.create(
