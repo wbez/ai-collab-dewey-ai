@@ -341,12 +341,24 @@ class Dewey:
         )
 
     def _replace_source_markers(self, text: str, source_urls: Dict[int, Optional[str]]) -> str:
+        display_numbers: Dict[str, int] = {}
+
+        def replace(match):
+            source_number = int(match.group(1))
+            source_url = source_urls.get(source_number)
+            footnote_key = source_url or f"src:{source_number}"
+            display_number = display_numbers.setdefault(
+                footnote_key,
+                len(display_numbers) + 1,
+            )
+            return self._format_source_reference(
+                display_number,
+                source_url,
+            )
+
         return re.sub(
             r"\[SRC(\d+)\]",
-            lambda match: self._format_source_reference(
-                int(match.group(1)),
-                source_urls.get(int(match.group(1))),
-            ),
+            replace,
             text,
         )
 

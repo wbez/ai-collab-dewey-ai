@@ -323,3 +323,44 @@ def test_replace_source_markers_leaves_plain_label_without_url():
     rendered = dewey._replace_source_markers("No link [SRC1].", {1: None})
 
     assert rendered == "No link [1]."
+
+
+def test_replace_source_markers_renumbers_by_first_appearance_in_answer():
+    dewey = make_dewey([])
+
+    rendered = dewey._replace_source_markers(
+        "Second source first [SRC2], then first source [SRC1], then second again [SRC2].",
+        {
+            1: "https://example.com/first",
+            2: "https://example.com/second",
+        },
+    )
+
+    assert rendered == (
+        'Second source first <a href="https://example.com/second" target="_blank" '
+        'rel="noopener noreferrer">[1]</a>, then first source '
+        '<a href="https://example.com/first" target="_blank" rel="noopener noreferrer">[2]</a>, '
+        'then second again <a href="https://example.com/second" target="_blank" '
+        'rel="noopener noreferrer">[1]</a>.'
+    )
+
+
+def test_replace_source_markers_reuses_number_for_duplicate_footnote_targets():
+    dewey = make_dewey([])
+
+    rendered = dewey._replace_source_markers(
+        "First duplicate [SRC2], unique [SRC1], duplicate again [SRC3].",
+        {
+            1: "https://example.com/unique",
+            2: "https://example.com/shared",
+            3: "https://example.com/shared",
+        },
+    )
+
+    assert rendered == (
+        'First duplicate <a href="https://example.com/shared" target="_blank" '
+        'rel="noopener noreferrer">[1]</a>, unique '
+        '<a href="https://example.com/unique" target="_blank" rel="noopener noreferrer">[2]</a>, '
+        'duplicate again <a href="https://example.com/shared" target="_blank" '
+        'rel="noopener noreferrer">[1]</a>.'
+    )
