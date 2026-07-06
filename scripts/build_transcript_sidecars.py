@@ -663,6 +663,7 @@ def _download_vtts(
     container_name: str = DEFAULT_TRANSCRIPT_CONTAINER,
     limit: Optional[int] = None,
     from_index: int = 0,
+    only_missing: bool = False,
 ) -> List[Path]:
     if from_index < 0:
         raise ValueError("--from must be 0 or greater")
@@ -680,6 +681,9 @@ def _download_vtts(
         selected = selected[:limit]
 
     directory.mkdir(parents=True, exist_ok=True)
+    existing_names = {path.name for path in directory.glob("*.vtt")} if only_missing else set()
+    if only_missing:
+        selected = [blob_name for blob_name in selected if Path(blob_name).name not in existing_names]
     downloaded: List[Path] = []
     for blob_name in tqdm(selected):
         payload = container.get_blob_client(blob_name).download_blob().readall()
@@ -1076,6 +1080,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Download .vtt files from Azure blob storage before generating sidecars.",
     )
     parser.add_argument(
+        "--download-new",
+        action="store_true",
+        help="Download only .vtt blobs whose filenames are not already present in the directory.",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -1089,6 +1098,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Zero-based starting offset into the sorted VTT blob list when --get-vtts is used.",
     )
     args = parser.parse_args(argv)
+    if args.get_vtts and args.download_new:
+        parser.error("--get-vtts and --download-new cannot be used together")
 
     directory = Path(args.directory).resolve()
     transcript_paths: List[Path]
@@ -1104,6 +1115,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             print(f"No VTT blobs downloaded into {directory}")
         transcript_paths, skipped = _dedupe_vtt_paths_by_occurrence_id(downloaded)
+        for occurrence_id, path in skipped:
+            print(f"Skipping duplicate occurrence_id {occurrence_id} for {path}")
+    elif args.download_new:
+        downloaded = _download_vtts(
+            directory,
+            limit=args.limit,
+            from_index=args.from_index,
+            only_missing=True,
+        )
+        if downloaded:
+            for path in downloaded:
+                print(f"Downloaded {path}")
+        else:
+            print(f"No new VTT blobs downloaded into {directory}")
+        transcript_paths, skipped = _dedupe_vtt_paths_by_occurrence_id(sorted(directory.glob("*.vtt")))
         for occurrence_id, path in skipped:
             print(f"Skipping duplicate occurrence_id {occurrence_id} for {path}")
     else:
