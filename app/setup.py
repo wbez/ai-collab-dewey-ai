@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from azure.core.credentials import AzureKeyCredential
 from azure.storage.blob.aio import BlobServiceClient
@@ -123,6 +123,23 @@ class SetupManager:
         if self.transcript_state_path.exists():
             self.transcript_state_path.unlink()
 
+    async def clean_article_content(self, config: Dict[str, str]):
+        print("\n🧹 Cleaning article blobs and indexed article chunks...")
+        _, _, search_manager = self.create_services(config)
+        await self.delete_all_blobs(
+            config["AZURE_STORAGE_CONNECTION_STRING"],
+            config["AZURE_STORAGE_CONTAINER_NAME"],
+        )
+        deleted_count = await search_manager.delete_chunks_by_content_type("article")
+        print(f"✅ Removed {deleted_count} indexed article chunk(s)")
+
+    async def clean_transcript_content(self, config: Dict[str, str]):
+        print("\n🧹 Cleaning indexed transcript chunks and local transcript state...")
+        _, _, search_manager = self.create_services(config)
+        deleted_count = await search_manager.delete_chunks_by_content_type("transcript")
+        self.clear_transcript_state()
+        print(f"✅ Removed {deleted_count} indexed transcript chunk(s)")
+
     def compute_stable_hash(self, payload: Any) -> str:
         normalized = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -130,13 +147,16 @@ class SetupManager:
     def compute_transcript_source_hash(self, vtt_path: Path, sidecar_path: Path) -> str:
         digest = hashlib.sha256()
         digest.update(b"transcript-chunker-v1\n")
-        digest.update(vtt_path.read_bytes())
+        with vtt_path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
         digest.update(b"\n--sidecar--\n")
-        digest.update(sidecar_path.read_bytes())
+        with sidecar_path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
         return digest.hexdigest()
 
-    def load_article_documents(self, json_files: List[Path]) -> List[Dict[str, Any]]:
-        documents: List[Dict[str, Any]] = []
+    def iter_article_documents(self, json_files: List[Path]) -> Iterator[Dict[str, Any]]:
         required_fields = ["headline", "content", "url", "authors", "publish_date"]
 
         for file_path in json_files:
@@ -170,34 +190,21 @@ class SetupManager:
                     "description": doc.get("description"),
                 }
                 valid_count += 1
-                documents.append(normalized_doc)
+                yield normalized_doc
 
             print(f"✅ Loaded {valid_count} valid article document(s) from {file_path.name}")
 
-        return documents
-
-    def load_transcript_documents(self, transcript_pairs: List[Tuple[Path, Path]]) -> List[Dict[str, Any]]:
-        bundles: List[Dict[str, Any]] = []
-        for vtt_path, sidecar_path in transcript_pairs:
-            try:
-                transcript_document = load_transcript_document(vtt_path, sidecar_path)
-                transcript_chunks = build_transcript_chunks(transcript_document)
-                print(
-                    f"✅ Loaded {len(transcript_chunks)} transcript chunk(s) from "
-                    f"{vtt_path.name}"
-                )
-                bundles.append(
-                    {
-                        "document": transcript_document,
-                        "chunks": transcript_chunks,
-                        "source_hash": self.compute_transcript_source_hash(vtt_path, sidecar_path),
-                        "vtt_path": vtt_path,
-                        "sidecar_path": sidecar_path,
-                    }
-                )
-            except Exception as exc:
-                print(f"❌ Error loading transcript {vtt_path.name}: {exc}")
-        return bundles
+    def load_transcript_bundle(self, vtt_path: Path, sidecar_path: Path) -> Dict[str, Any]:
+        transcript_document = load_transcript_document(vtt_path, sidecar_path)
+        transcript_chunks = build_transcript_chunks(transcript_document)
+        print(f"✅ Loaded {len(transcript_chunks)} transcript chunk(s) from {vtt_path.name}")
+        return {
+            "document": transcript_document,
+            "chunks": transcript_chunks,
+            "source_hash": self.compute_transcript_source_hash(vtt_path, sidecar_path),
+            "vtt_path": vtt_path,
+            "sidecar_path": sidecar_path,
+        }
 
     def create_services(self, config: Dict[str, str]):
         search_info = SearchInfo(
@@ -257,13 +264,10 @@ class SetupManager:
         self,
         blob_connection_string: str,
         container_name: str,
-        documents: List[Dict[str, Any]],
+        documents: Iterable[Dict[str, Any]],
+        total_documents: Optional[int] = None,
     ):
-        if not documents:
-            print("📄 No article documents to upload")
-            return {"uploaded": 0, "skipped": 0, "failed": 0}
-
-        print(f"📤 Uploading {len(documents)} article document(s) to blob storage...")
+        print("📤 Uploading article document(s) to blob storage...")
         async with BlobServiceClient.from_connection_string(blob_connection_string) as blob_service_client:
             container_client = blob_service_client.get_container_client(container_name)
             try:
@@ -271,57 +275,83 @@ class SetupManager:
             except Exception:
                 pass
 
+            existing_hashes_by_blob_name = await self.load_blob_content_hashes(container_client)
+            accepted_content_hashes: set[str] = set()
             success_count = 0
             skipped_count = 0
             failed_count = 0
             progress = tqdm(
-                enumerate(documents),
-                total=len(documents),
+                documents,
+                total=total_documents,
                 desc="Uploading articles",
                 unit="doc",
-                smoothing=0.6
+                smoothing=0.6,
             )
-            for index, doc in progress:
-                try:
-                    blob_name = f"doc_{doc.get('id', index)}.json"
-                    blob_data = json.dumps(doc, ensure_ascii=False, indent=2)
-                    content_hash = self.compute_stable_hash(doc)
-                    blob_client = blob_service_client.get_blob_client(
-                        container=container_name,
-                        blob=blob_name,
-                    )
-                    existing_hash = None
-                    if await blob_client.exists():
-                        properties = await blob_client.get_blob_properties()
-                        existing_hash = (properties.metadata or {}).get("content_hash")
-                    if existing_hash == content_hash:
-                        skipped_count += 1
+            try:
+                for index, doc in enumerate(progress):
+                    try:
+                        blob_name = f"doc_{doc.get('id', index)}.json"
+                        blob_data = json.dumps(doc, ensure_ascii=False, indent=2)
+                        content_hash = self.compute_stable_hash(doc)
+                        if content_hash in accepted_content_hashes:
+                            skipped_count += 1
+                            progress.set_postfix(
+                                uploaded=success_count,
+                                skipped=skipped_count,
+                                refresh=False,
+                            )
+                            continue
+                        existing_hash = existing_hashes_by_blob_name.get(blob_name)
+                        if existing_hash == content_hash:
+                            accepted_content_hashes.add(content_hash)
+                            skipped_count += 1
+                            progress.set_postfix(
+                                uploaded=success_count,
+                                skipped=skipped_count,
+                                refresh=False,
+                            )
+                            continue
+                        blob_client = blob_service_client.get_blob_client(
+                            container=container_name,
+                            blob=blob_name,
+                        )
+                        await blob_client.upload_blob(
+                            blob_data,
+                            overwrite=True,
+                            metadata={"content_hash": content_hash},
+                        )
+                        existing_hashes_by_blob_name[blob_name] = content_hash
+                        accepted_content_hashes.add(content_hash)
+                        success_count += 1
                         progress.set_postfix(
                             uploaded=success_count,
                             skipped=skipped_count,
                             refresh=False,
                         )
-                        continue
-                    await blob_client.upload_blob(
-                        blob_data,
-                        overwrite=True,
-                        metadata={"content_hash": content_hash},
-                    )
-                    success_count += 1
-                    progress.set_postfix(
-                        uploaded=success_count,
-                        skipped=skipped_count,
-                        refresh=False,
-                    )
-                except Exception as exc:
-                    failed_count += 1
-                    print(f"❌ Error uploading article document {index}: {exc}")
+                    except Exception as exc:
+                        failed_count += 1
+                        print(f"❌ Error uploading article document {index}: {exc}")
+            finally:
+                progress.close()
+
+            if success_count == 0 and skipped_count == 0 and failed_count == 0:
+                print("📄 No article documents to upload")
+                return {"uploaded": 0, "skipped": 0, "failed": 0}
 
             print(
                 "✅ Article blob sync complete: "
                 f"{success_count} uploaded, {skipped_count} skipped, {failed_count} failed"
             )
             return {"uploaded": success_count, "skipped": skipped_count, "failed": failed_count}
+
+    async def load_blob_content_hashes(self, container_client: Any) -> Dict[str, str]:
+        hashes_by_blob_name: Dict[str, str] = {}
+        async for blob in container_client.list_blobs(include=["metadata"]):
+            metadata = getattr(blob, "metadata", None) or {}
+            content_hash = metadata.get("content_hash")
+            if content_hash:
+                hashes_by_blob_name[blob.name] = content_hash
+        return hashes_by_blob_name
 
     async def run_indexer(self, search_info: SearchInfo, indexer_name: str):
         print(f"🔄 Running indexer '{indexer_name}' to process article documents...")
@@ -354,53 +384,50 @@ class SetupManager:
     async def upload_transcript_chunks(
         self,
         search_manager: SearchManager,
-        transcript_bundles: List[Dict[str, Any]],
+        transcript_pairs: List[Tuple[Path, Path]],
         state: Dict[str, Dict[str, str]],
     ):
-        if not transcript_bundles:
+        if not transcript_pairs:
             print("🎙️  No transcript chunks to upload")
             return {"uploaded": 0, "skipped": 0, "deleted": 0, "failed": 0}
 
         transcript_state = state.setdefault("transcripts", {})
-        bundles_to_upload = []
         uploaded_bundle_count = 0
         skipped_bundle_count = 0
         deleted_chunk_count = 0
         failed_bundle_count = 0
-
-        for bundle in transcript_bundles:
-            parent_id = bundle["document"]["id"]
-            source_hash = bundle["source_hash"]
-            if transcript_state.get(parent_id) == source_hash:
-                skipped_bundle_count += 1
-                continue
-            bundles_to_upload.append(bundle)
-
-        total_chunk_count = sum(len(bundle["chunks"]) for bundle in bundles_to_upload)
-        if not bundles_to_upload:
-            print(f"🎙️  Transcript sync complete: 0 uploaded, {skipped_bundle_count} skipped")
-            return {"uploaded": 0, "skipped": skipped_bundle_count, "deleted": 0, "failed": 0}
-
-        print(f"📤 Uploading {total_chunk_count} transcript chunk(s) directly to search...")
-        progress = tqdm(total=total_chunk_count, desc="Uploading transcripts", unit="chunk", smoothing=0.6)
+        print("📤 Uploading transcript chunk(s) directly to search...")
+        progress = tqdm(desc="Uploading transcripts", unit="chunk", smoothing=0.6)
 
         try:
-            for bundle in bundles_to_upload:
+            for vtt_path, sidecar_path in transcript_pairs:
+                try:
+                    bundle = self.load_transcript_bundle(vtt_path, sidecar_path)
+                except Exception as exc:
+                    failed_bundle_count += 1
+                    print(f"❌ Error loading transcript {vtt_path.name}: {exc}")
+                    continue
+
                 parent_id = bundle["document"]["id"]
-                deleted_chunk_count += await search_manager.delete_transcript_chunks(parent_id)
-                await search_manager.upload_transcript_chunks(
-                    bundle["chunks"],
-                    progress_callback=progress.update,
-                )
+                if transcript_state.get(parent_id) == bundle["source_hash"]:
+                    skipped_bundle_count += 1
+                    continue
+
+                try:
+                    deleted_chunk_count += await search_manager.delete_transcript_chunks(parent_id)
+                    await search_manager.upload_transcript_chunks(
+                        bundle["chunks"],
+                        progress_callback=progress.update,
+                    )
+                except Exception:
+                    failed_bundle_count += 1
+                    raise
+
                 transcript_state[parent_id] = bundle["source_hash"]
+                self.save_transcript_state(state)
                 uploaded_bundle_count += 1
-        except Exception:
-            failed_bundle_count += 1
-            raise
         finally:
             progress.close()
-
-        self.save_transcript_state(state)
         print(
             "✅ Transcript sync complete: "
             f"{uploaded_bundle_count} bundle(s) uploaded, "
@@ -414,7 +441,12 @@ class SetupManager:
             "failed": failed_bundle_count,
         }
 
-    async def run_setup(self, clean: bool = False):
+    async def run_setup(
+        self,
+        clean: bool = False,
+        clean_articles: bool = False,
+        clean_transcripts: bool = False,
+    ):
         print("=" * 60)
         print("🔍 Azure AI Search Setup")
         print("=" * 60)
@@ -434,10 +466,13 @@ class SetupManager:
                 await clean_search_manager.cleanup_search_resources()
                 self.clear_transcript_state()
                 print("✅ Clean completed")
+            else:
+                if clean_articles:
+                    await self.clean_article_content(config)
+                if clean_transcripts:
+                    await self.clean_transcript_content(config)
 
             article_files, transcript_pairs = self.discover_inputs()
-            article_documents = self.load_article_documents(article_files) if article_files else []
-            transcript_bundles = self.load_transcript_documents(transcript_pairs) if transcript_pairs else []
             transcript_state = self.load_transcript_state()
 
             print("\n🚀 Setting up Azure AI Search resources...")
@@ -447,11 +482,11 @@ class SetupManager:
             indexer_status = "not_needed"
             transcript_sync = {"uploaded": 0, "skipped": 0, "deleted": 0, "failed": 0}
 
-            if article_documents:
+            if article_files:
                 article_sync = await self.upload_documents_to_blob(
                     config["AZURE_STORAGE_CONNECTION_STRING"],
                     config["AZURE_STORAGE_CONTAINER_NAME"],
-                    article_documents,
+                    self.iter_article_documents(article_files),
                 )
                 if article_sync["uploaded"] > 0 or clean:
                     print("\n🔄 Processing article documents through skillset...")
@@ -459,11 +494,11 @@ class SetupManager:
                 else:
                     indexer_status = "skipped_no_changes"
 
-            if transcript_bundles:
+            if transcript_pairs:
                 print("\n🔄 Uploading transcript chunks...")
                 transcript_sync = await self.upload_transcript_chunks(
                     search_manager,
-                    transcript_bundles,
+                    transcript_pairs,
                     transcript_state,
                 )
 
@@ -501,10 +536,24 @@ async def main():
         action="store_true",
         help="Delete all existing blobs, search index resources, and transcript ingest state before setup.",
     )
+    parser.add_argument(
+        "--clean-articles",
+        action="store_true",
+        help="Delete existing article blobs and indexed article chunks before setup.",
+    )
+    parser.add_argument(
+        "--clean-transcripts",
+        action="store_true",
+        help="Delete indexed transcript chunks and local transcript ingest state before setup.",
+    )
     args = parser.parse_args()
 
     setup_manager = SetupManager()
-    await setup_manager.run_setup(clean=args.clean)
+    await setup_manager.run_setup(
+        clean=args.clean,
+        clean_articles=args.clean_articles,
+        clean_transcripts=args.clean_transcripts,
+    )
 
 
 if __name__ == "__main__":

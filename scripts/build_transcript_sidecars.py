@@ -116,7 +116,7 @@ def _run_query(sql: str, params: Optional[Tuple[Any, ...]] = None) -> List[Dict[
     db_user = os.getenv("AWS_DB_USER", "svc_trnscrpt")
     db_host = os.getenv(
         "AWS_DB_HOST",
-        "collective-access-db.cluster-ro-cuhegju9o0up.us-east-1.rds.amazonaws.com",
+        "collective-access-db-2026.cluster-ro-cuhegju9o0up.us-east-1.rds.amazonaws.com",
     )
     db_port = int(os.getenv("AWS_DB_PORT", 3306))
     db_name = os.getenv("AWS_DB_NAME", "collectiveassets")
@@ -1053,9 +1053,12 @@ def _dedupe_vtt_paths_by_occurrence_id(
     return kept, skipped
 
 
-def build_sidecars_for_paths(transcript_paths: Sequence[Path]) -> List[Path]:
+def build_sidecars_for_paths(transcript_paths: Sequence[Path], avoid: Sequence[Path] = []) -> List[Path]:
     created: List[Path] = []
+    avoid_stems = [i.stem for i in list(avoid)]
     for transcript_path in tqdm(sorted(transcript_paths)):
+        if transcript_path.stem in avoid_stems:
+            continue
         created.append(build_sidecar_for_vtt(transcript_path))
     return created
 
@@ -1134,8 +1137,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"Skipping duplicate occurrence_id {occurrence_id} for {path}")
     else:
         transcript_paths = sorted(directory.glob("*.vtt"))
+    
+    existing_sidecars = directory.glob("*.json")
 
-    created = build_sidecars_for_paths(transcript_paths)
+    created = build_sidecars_for_paths(transcript_paths, avoid = existing_sidecars)
     if not created:
         print(f"No .vtt files found in {directory}")
         return 0

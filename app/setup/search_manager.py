@@ -455,9 +455,9 @@ class SearchManager:
             except Exception:
                 pass
 
-    async def list_chunk_ids_by_parent(self, parent_id: str) -> List[str]:
+    async def list_chunk_ids(self, filter_expression: str) -> List[str]:
         if not isinstance(self.search_info.credential, AzureKeyCredential):
-            raise TypeError("Transcript deletion currently requires an AzureKeyCredential.")
+            raise TypeError("Chunk lookup currently requires an AzureKeyCredential.")
 
         endpoint = self.search_info.endpoint.rstrip("/")
         url = (
@@ -472,11 +472,10 @@ class SearchManager:
         chunk_ids: List[str] = []
         skip = 0
         page_size = 1000
-        safe_parent_id = parent_id.replace("'", "''")
         while True:
             payload = {
                 "search": "*",
-                "filter": f"parent_id eq '{safe_parent_id}'",
+                "filter": filter_expression,
                 "select": "chunk_id",
                 "top": page_size,
                 "skip": skip,
@@ -487,9 +486,11 @@ class SearchManager:
                     headers=headers,
                     data=json.dumps(payload).encode("utf-8"),
                 ) as response:
+                    if response.status == 404:
+                        return []
                     if response.status >= 400:
                         raise RuntimeError(
-                            "Failed to list transcript chunks from Azure Search: "
+                            "Failed to list chunks from Azure Search: "
                             f"{response.status} {await response.text()}"
                         )
                     body = await response.json()
@@ -502,10 +503,16 @@ class SearchManager:
 
         return chunk_ids
 
-    async def delete_transcript_chunks(self, parent_id: str) -> int:
-        chunk_ids = await self.list_chunk_ids_by_parent(parent_id)
+    async def list_chunk_ids_by_parent(self, parent_id: str) -> List[str]:
+        safe_parent_id = parent_id.replace("'", "''")
+        return await self.list_chunk_ids(f"parent_id eq '{safe_parent_id}'")
+
+    async def delete_chunks(self, chunk_ids: List[str]) -> int:
         if not chunk_ids:
             return 0
+
+        if not isinstance(self.search_info.credential, AzureKeyCredential):
+            raise TypeError("Chunk deletion currently requires an AzureKeyCredential.")
 
         endpoint = self.search_info.endpoint.rstrip("/")
         url = (
@@ -535,12 +542,23 @@ class SearchManager:
                     headers=headers,
                     data=json.dumps(payload).encode("utf-8"),
                 ) as response:
+                    if response.status == 404:
+                        return 0
                     if response.status >= 400:
                         raise RuntimeError(
-                            "Failed to delete transcript chunks from Azure Search: "
+                            "Failed to delete chunks from Azure Search: "
                             f"{response.status} {await response.text()}"
                         )
         return len(chunk_ids)
+
+    async def delete_transcript_chunks(self, parent_id: str) -> int:
+        chunk_ids = await self.list_chunk_ids_by_parent(parent_id)
+        return await self.delete_chunks(chunk_ids)
+
+    async def delete_chunks_by_content_type(self, content_type: str) -> int:
+        safe_content_type = content_type.replace("'", "''")
+        chunk_ids = await self.list_chunk_ids(f"content_type eq '{safe_content_type}'")
+        return await self.delete_chunks(chunk_ids)
 
     async def upload_transcript_chunks(
         self,
