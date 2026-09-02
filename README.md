@@ -105,11 +105,35 @@ This will:
 - Upload documents to blob storage
 - Process documents through AI Search pipeline
 
+To force a full transcript reupload after transcript schema or chunking changes, run:
+
+```bash
+python app/setup.py --clean-transcripts
+```
+
+This deletes indexed transcript chunks, clears local transcript ingest state, and uploads fresh chunks.
+
 3. Launch Dewey
 ```bash
 python main.py
 ```
 The application will be available at `http://localhost:7860`. This project uses Gradio to create a user-friendly web interface for our machine learning model. You can learn more about Gradio at https://www.gradio.app/.
+
+Set `GRADIO_SERVER_PORT` to run the web app on a different port. The Wavelength MCP server uses `WAVELENGTH_HTTP_PORT` separately.
+
+### Slack Agent View
+
+The Wavelength Slack app uses Slack Agent View, app mentions, DMs, and the `/wavelength` slash command. The Slack app should point event subscriptions at `/slack/events` and slash commands at `/slack/commands/wavelength`.
+
+For production, expose the service over public HTTPS (TLS 1.2+) and configure `WAVELENGTH_PUBLIC_BASE_URL`, `WAVELENGTH_MCP_AUTH_TOKEN`, and the persistent `WAVELENGTH_STATE_DB` volume. The MCP endpoint accepts only the bearer token; Slack signatures authenticate only Slack routes. Set `WAVELENGTH_RESPONSES_MCP_ENABLED=true` after the public endpoint has been verified from Azure.
+
+MCP remains available at `/mcp` for this project's own clients, but the Slack app manifest does not need `mcp:connect` or an `mcp_servers` entry.
+
+Run the Slack/MCP HTTP service with:
+
+```bash
+python app/mcp_server.py
+```
 
 
 ## Usage

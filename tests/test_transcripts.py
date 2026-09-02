@@ -34,8 +34,10 @@ def test_load_vtt_parses_notes_and_speakers(tmp_path):
     assert notes["object_id"] == "22563"
     assert notes["source_url"] == "https://example.com/audio.mp3"
     assert cues[0].speaker == "Host"
+    assert cues[0].raw_vtt_excerpt == "00:00:01.000 --> 00:00:03.000\nHost: Welcome back."
     assert cues[1].speaker == "Guest"
     assert cues[1].text == "Thanks for having me."
+    assert cues[1].raw_vtt_excerpt == "00:00:03.000 --> 00:00:06.000\n<v Guest>Thanks for having me.</v>"
 
 
 def test_build_transcript_chunks_merges_short_turns(tmp_path):
@@ -87,9 +89,11 @@ def test_build_transcript_chunks_merges_short_turns(tmp_path):
     )
 
     document = load_transcript_document(vtt_path, metadata_path)
-    chunks = build_transcript_chunks(document)
+    chunks = build_transcript_chunks(document, source_hash="abcdef1234567890abcdef1234567890")
 
     assert chunks
+    assert chunks[0]["chunk_id"] == "abcdef1234567890abcdef1234567890-0"
+    assert chunks[0]["parent_id"] == "abcdef1234567890abcdef1234567890"
     assert chunks[0]["content_type"] == "transcript"
     assert chunks[0]["occurrence_id"] == "1299"
     assert chunks[0]["title"] == "episode.mp3"
@@ -97,7 +101,12 @@ def test_build_transcript_chunks_merges_short_turns(tmp_path):
     assert chunks[0]["transcript_name"] == "episode.vtt"
     assert chunks[0]["citation_url"] == "https://example.com/audio.mp3#t=1"
     assert chunks[0]["recording_urls"] == ["https://example.com/audio.mp3"]
+    assert chunks[0]["start_seconds"] == 1.0
+    assert chunks[0]["end_seconds"] == 40.0
+    assert chunks[0]["content"] == chunks[0]["chunk_text"]
     assert chunks[0]["chunk_text"]
+    assert "00:00:01.000 --> 00:00:03.000\nHost: Hello there." in chunks[0]["raw_vtt_excerpt"]
+    assert "00:00:05.000 --> 00:00:40.000\nGuest: Longer discussion sentence." in chunks[0]["raw_vtt_excerpt"]
     assert "Host" in chunks[0]["speakers"]
     assert "Guest" in chunks[0]["speakers"]
     assert chunks[0]["program"] == "Radio Times"

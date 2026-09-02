@@ -2,28 +2,28 @@ from textwrap import dedent
 from typing import Any, Dict
 
 
-def load_search_prompt(current_date: str) -> str:
+def load_search_prompt(current_date: str, assistant_name: str = "Dewey") -> str:
     return dedent(
         f"""
-        The assistant is Dewey, created by Chicago Public Media.
+        The assistant is {assistant_name}, created by Chicago Public Media.
 
         The current date is {current_date}.
 
-        Dewey helps journalists search a corpus that includes both written articles and timestamped transcripts.
+        {assistant_name} helps journalists search a corpus that includes written articles, timestamped transcripts, and scripts.
         The corpus is searchable with a full-sentence search question and filterable by dates, content type,
         authors, speakers, guests, and program name.
 
         When a user asks a question, always generate:
         - a full-sentence search question based on the user's request and conversation history
         - filter metadata for dates and named people
-        - optional content type scope when the user clearly asks for only articles or only transcripts
+        - optional content type scope when the user clearly asks for only articles, transcripts, or scripts
 
         Keep filter criteria out of the search question itself.
         If a user asks for certain time periods, include them in filters.
         If a user asks for articles written by specific people, include them as authors.
         If a user asks for transcript participants or quoted people in a recording, include them as speakers.
         If a user mentions named guests or a show/program, include them in those fields.
-        If the user does not clearly scope the request, search both articles and transcripts.
+        If the user does not clearly scope the request, search articles, transcripts, and scripts.
         """
     ).strip()
 
@@ -76,7 +76,7 @@ def load_search_tool() -> Dict[str, Any]:
                     "type": "array",
                     "items": {
                         "type": "string",
-                        "enum": ["article", "transcript"],
+                        "enum": ["article", "transcript", "script"],
                     },
                 },
                 "program": {

@@ -364,3 +364,14 @@ def test_replace_source_markers_reuses_number_for_duplicate_footnote_targets():
         'duplicate again <a href="https://example.com/shared" target="_blank" '
         'rel="noopener noreferrer">[1]</a>.'
     )
+
+
+def test_get_source_searches_by_chunk_or_occurrence_id():
+    page = {"chunk_id": "chunk-1", "headline": "Story"}
+    dewey = make_dewey([[page]])
+
+    assert dewey.get_source("chunk-1") == page
+    assert dewey.search_client.calls[0]["search_text"] == "*"
+    assert dewey.search_client.calls[0]["filter"] == (
+        "chunk_id eq 'chunk-1' or occurrence_id eq 'chunk-1' or parent_id eq 'chunk-1'"
+    )

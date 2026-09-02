@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import sys
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -19,6 +21,7 @@ from transcripts import (
     build_transcript_chunks,
     load_transcript_document,
 )
+from scripts_content import build_script_chunks, load_script_document
 
 
 class ConfigurationError(Exception):
@@ -77,16 +80,43 @@ class SetupManager:
 
         return config
 
-    def discover_inputs(self) -> Tuple[List[Path], List[Tuple[Path, Path]]]:
+    def discover_inputs(
+        self, modified_since: Optional[datetime] = None
+    ) -> Tuple[List[Path], List[Tuple[Path, Path]], List[Path]]:
         if not self.data_folder.exists():
             print(f"📁 Creating data folder at {self.data_folder}")
             self.data_folder.mkdir(exist_ok=True)
-            return [], []
+            return [], [], []
 
-        json_files = sorted(self.data_folder.glob("*.json"))
+        json_files = sorted(self.data_folder.rglob("*.json"))
         vtt_files = sorted(self.data_folder.glob("*.vtt"))
         vtt_stems = {path.stem for path in vtt_files}
-        article_json_files = [path for path in json_files if path.stem not in vtt_stems]
+        if modified_since is not None:
+            def changed_since(path: Path) -> bool:
+                return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) >= modified_since
+            json_files = [path for path in json_files if changed_since(path)]
+            vtt_files = [path for path in vtt_files if changed_since(path)]
+        script_json_files: List[Path] = []
+        article_json_files: List[Path] = []
+        scripts_folder = self.data_folder / "scripts"
+        for path in json_files:
+            if path.stem in vtt_stems:
+                continue
+            if path.parent == scripts_folder:
+                script_json_files.append(path)
+                continue
+            try:
+                # Article exports can be large; inspect only a small prefix unless the
+                # document lives in the dedicated scripts directory above.
+                with path.open(encoding="utf-8") as handle:
+                    payload = json.loads(handle.read(4096))
+            except Exception:
+                article_json_files.append(path)
+                continue
+            if isinstance(payload, dict) and payload.get("content_type") == "script":
+                script_json_files.append(path)
+            else:
+                article_json_files.append(path)
 
         transcript_pairs: List[Tuple[Path, Path]] = []
         for vtt_path in vtt_files:
@@ -100,10 +130,12 @@ class SetupManager:
             print(f"📄 Found {len(article_json_files)} article JSON file(s)")
         if transcript_pairs:
             print(f"🎙️  Found {len(transcript_pairs)} transcript bundle(s)")
-        if not article_json_files and not transcript_pairs:
+        if script_json_files:
+            print(f"📝 Found {len(script_json_files)} script document(s)")
+        if not article_json_files and not transcript_pairs and not script_json_files:
             print(f"📁 No supported input files found in {self.data_folder}")
 
-        return article_json_files, transcript_pairs
+        return article_json_files, transcript_pairs, script_json_files
 
     def load_transcript_state(self) -> Dict[str, Dict[str, str]]:
         if not self.transcript_state_path.exists():
@@ -140,12 +172,28 @@ class SetupManager:
         self.clear_transcript_state()
         print(f"✅ Removed {deleted_count} indexed transcript chunk(s)")
 
+    async def clean_script_content(self, config: Dict[str, str]):
+        print("\n🧹 Cleaning indexed script chunks and local script state...")
+        _, _, search_manager = self.create_services(config)
+        deleted_count = await search_manager.delete_chunks_by_content_type("script")
+        state = self.load_transcript_state()
+        state.pop("scripts", None)
+        self.save_transcript_state(state)
+        print(f"✅ Removed {deleted_count} indexed script chunk(s)")
+
     def compute_stable_hash(self, payload: Any) -> str:
         normalized = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return hashlib.md5(normalized.encode("utf-8")).hexdigest()
 
-    def compute_transcript_source_hash(self, vtt_path: Path, sidecar_path: Path) -> str:
-        digest = hashlib.sha256()
+    def compute_file_md5(self, path: Path) -> str:
+        digest = hashlib.md5()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def compute_transcript_ingest_hash(self, vtt_path: Path, sidecar_path: Path) -> str:
+        digest = hashlib.md5()
         digest.update(b"transcript-chunker-v1\n")
         with vtt_path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
@@ -156,54 +204,155 @@ class SetupManager:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def iter_json_documents_from_file(self, file_path: Path) -> Iterator[Any]:
+        decoder = json.JSONDecoder()
+        chunk_size = 1024 * 1024
+
+        with file_path.open(encoding="utf-8") as handle:
+            buffer = ""
+            eof = False
+
+            def read_more() -> bool:
+                nonlocal buffer, eof
+                chunk = handle.read(chunk_size)
+                if not chunk:
+                    eof = True
+                    return False
+                buffer += chunk
+                return True
+
+            def discard_leading_whitespace() -> None:
+                nonlocal buffer
+                buffer = buffer.lstrip()
+
+            def decode_value() -> Any:
+                nonlocal buffer
+                while True:
+                    try:
+                        document, consumed = decoder.raw_decode(buffer)
+                    except json.JSONDecodeError:
+                        if eof or not read_more():
+                            raise
+                        continue
+                    buffer = buffer[consumed:]
+                    return document
+
+            while not buffer and read_more():
+                pass
+            discard_leading_whitespace()
+            if not buffer:
+                return
+
+            if buffer[0] != "[":
+                document = decode_value()
+                discard_leading_whitespace()
+                while not buffer and not eof:
+                    read_more()
+                    discard_leading_whitespace()
+                if buffer:
+                    raise json.JSONDecodeError("Extra data", buffer, 0)
+                yield document
+                return
+
+            buffer = buffer[1:]
+            expect_value = True
+            seen_value = False
+            while True:
+                discard_leading_whitespace()
+                while not buffer and not eof:
+                    read_more()
+                    discard_leading_whitespace()
+
+                if not buffer:
+                    if eof:
+                        raise json.JSONDecodeError("Unterminated JSON array", "", 0)
+                    continue
+                if buffer[0] == "]":
+                    if expect_value and seen_value:
+                        raise json.JSONDecodeError("Trailing comma in JSON array", buffer, 0)
+                    return
+                if not expect_value:
+                    if buffer[0] != ",":
+                        raise json.JSONDecodeError("Expecting ',' delimiter", buffer, 0)
+                    buffer = buffer[1:]
+                    expect_value = True
+                    continue
+
+                if buffer[0] == ",":
+                    raise json.JSONDecodeError("Expecting value", buffer, 0)
+                yield decode_value()
+                expect_value = False
+                seen_value = True
+
     def iter_article_documents(self, json_files: List[Path]) -> Iterator[Dict[str, Any]]:
         required_fields = ["headline", "content", "url", "authors", "publish_date"]
 
         for file_path in json_files:
             try:
-                data = json.loads(file_path.read_text(encoding="utf-8"))
+                file_documents = self.iter_json_documents_from_file(file_path)
             except Exception as exc:
                 print(f"❌ Error loading {file_path.name}: {exc}")
                 continue
 
-            file_documents = data if isinstance(data, list) else [data]
             valid_count = 0
-            for index, doc in enumerate(file_documents):
-                missing_fields = [
-                    field
-                    for field in required_fields
-                    if field not in doc or doc[field] in ("", None, [])
-                ]
-                if missing_fields:
-                    print(
-                        f"⚠️  Skipping document {index} in {file_path.name}: "
-                        f"missing required fields: {', '.join(missing_fields)}"
-                    )
-                    continue
+            try:
+                for index, doc in enumerate(file_documents):
+                    if not isinstance(doc, dict):
+                        print(
+                            f"⚠️  Skipping document {index} in {file_path.name}: "
+                            "expected a JSON object"
+                        )
+                        continue
 
-                authors = [str(author).strip() for author in doc.get("authors", []) if str(author).strip()]
-                normalized_doc = {
-                    **doc,
-                    "authors": authors,
-                    "content_type": "article",
-                    "author_search_text": build_name_search_text(authors),
-                    "description": doc.get("description"),
-                }
-                valid_count += 1
-                yield normalized_doc
+                    missing_fields = [
+                        field
+                        for field in required_fields
+                        if field not in doc or doc[field] in ("", None, [])
+                    ]
+                    if missing_fields:
+                        print(
+                            f"⚠️  Skipping document {index} in {file_path.name}: "
+                            f"missing required fields: {', '.join(missing_fields)}"
+                        )
+                        continue
+
+                    authors = [str(author).strip() for author in doc.get("authors", []) if str(author).strip()]
+                    normalized_doc = {
+                        **doc,
+                        "authors": authors,
+                        "content_type": "article",
+                        "author_search_text": build_name_search_text(authors),
+                        "description": doc.get("description"),
+                    }
+                    normalized_doc["source_id"] = self.compute_stable_hash(normalized_doc)
+                    valid_count += 1
+                    yield normalized_doc
+            except Exception as exc:
+                print(f"❌ Error loading {file_path.name}: {exc}")
+                continue
 
             print(f"✅ Loaded {valid_count} valid article document(s) from {file_path.name}")
 
     def load_transcript_bundle(self, vtt_path: Path, sidecar_path: Path) -> Dict[str, Any]:
+        source_hash = self.compute_file_md5(vtt_path)
         transcript_document = load_transcript_document(vtt_path, sidecar_path)
-        transcript_chunks = build_transcript_chunks(transcript_document)
+        transcript_chunks = build_transcript_chunks(transcript_document, source_hash=source_hash)
         print(f"✅ Loaded {len(transcript_chunks)} transcript chunk(s) from {vtt_path.name}")
         return {
             "document": transcript_document,
             "chunks": transcript_chunks,
-            "source_hash": self.compute_transcript_source_hash(vtt_path, sidecar_path),
+            "source_hash": source_hash,
+            "ingest_hash": self.compute_transcript_ingest_hash(vtt_path, sidecar_path),
             "vtt_path": vtt_path,
             "sidecar_path": sidecar_path,
+        }
+
+    def load_script_bundle(self, script_path: Path) -> Dict[str, Any]:
+        document = load_script_document(script_path)
+        return {
+            "document": document,
+            "chunks": build_script_chunks(document),
+            "source_hash": self.compute_stable_hash(document),
         }
 
     def create_services(self, config: Dict[str, str]):
@@ -229,7 +378,7 @@ class SetupManager:
         )
         return search_info, embeddings, search_manager
 
-    async def setup_azure_resources(self, config: Dict[str, str]) -> tuple:
+    async def setup_azure_resources(self, config: Dict[str, str], *, update_existing_indexer: bool = False) -> tuple:
         search_info, embeddings, search_manager = self.create_services(config)
 
         print("🔧 Creating Azure AI Search index...")
@@ -242,10 +391,15 @@ class SetupManager:
             config["AZURE_STORAGE_CONTAINER_NAME"],
         )
 
-        print("⚙️  Setting up article skillset and indexer...")
-        indexer_name = await search_manager.setup()
-        print(f"✅ Skillset and indexer '{indexer_name}' created successfully")
-        return search_info, embeddings, search_manager
+        print("⚙️  Checking article skillset and indexer...")
+        indexer_name, indexer_updated = await search_manager.setup(
+            update_existing_indexer=update_existing_indexer
+        )
+        if indexer_updated:
+            print(f"✅ Skillset and indexer '{indexer_name}' created or updated")
+        else:
+            print(f"✅ Preserved existing indexer '{indexer_name}'")
+        return search_info, embeddings, search_manager, indexer_updated
 
     async def ensure_blob_container(
         self,
@@ -408,12 +562,23 @@ class SetupManager:
                     print(f"❌ Error loading transcript {vtt_path.name}: {exc}")
                     continue
 
-                parent_id = bundle["document"]["id"]
-                if transcript_state.get(parent_id) == bundle["source_hash"]:
+                parent_id = bundle["source_hash"]
+                state_key = str(bundle["document"]["id"])
+                ingest_hash = bundle.get("ingest_hash", bundle["source_hash"])
+                previous_state = transcript_state.get(state_key)
+                if isinstance(previous_state, dict):
+                    previous_ingest_hash = previous_state.get("ingest_hash")
+                    previous_parent_id = previous_state.get("parent_id")
+                else:
+                    previous_ingest_hash = previous_state
+                    previous_parent_id = state_key if previous_state is not None else None
+                if previous_ingest_hash == ingest_hash:
                     skipped_bundle_count += 1
                     continue
 
                 try:
+                    if previous_parent_id and previous_parent_id != parent_id:
+                        deleted_chunk_count += await search_manager.delete_transcript_chunks(str(previous_parent_id))
                     deleted_chunk_count += await search_manager.delete_transcript_chunks(parent_id)
                     await search_manager.upload_transcript_chunks(
                         bundle["chunks"],
@@ -423,7 +588,10 @@ class SetupManager:
                     failed_bundle_count += 1
                     raise
 
-                transcript_state[parent_id] = bundle["source_hash"]
+                transcript_state[state_key] = {
+                    "ingest_hash": ingest_hash,
+                    "parent_id": parent_id,
+                }
                 self.save_transcript_state(state)
                 uploaded_bundle_count += 1
         finally:
@@ -441,11 +609,37 @@ class SetupManager:
             "failed": failed_bundle_count,
         }
 
+    async def upload_script_chunks(
+        self, search_manager: SearchManager, script_paths: List[Path], state: Dict[str, Dict[str, str]]
+    ):
+        script_state = state.setdefault("scripts", {})
+        uploaded = skipped = deleted = failed = 0
+        for script_path in script_paths:
+            try:
+                bundle = self.load_script_bundle(script_path)
+                parent_id = str(bundle["document"]["id"])
+                if script_state.get(parent_id) == bundle["source_hash"]:
+                    skipped += 1
+                    continue
+                deleted += await search_manager.delete_transcript_chunks(parent_id)
+                await search_manager.upload_transcript_chunks(bundle["chunks"])
+                script_state[parent_id] = bundle["source_hash"]
+                self.save_transcript_state(state)
+                uploaded += 1
+            except Exception as exc:
+                failed += 1
+                print(f"❌ Error loading script {script_path.name}: {exc}")
+        print(f"✅ Script sync complete: {uploaded} uploaded, {skipped} skipped, {deleted} old chunk(s) deleted")
+        return {"uploaded": uploaded, "skipped": skipped, "deleted": deleted, "failed": failed}
+
     async def run_setup(
         self,
         clean: bool = False,
         clean_articles: bool = False,
         clean_transcripts: bool = False,
+        clean_scripts: bool = False,
+        modified_since: Optional[datetime] = None,
+        update_existing_indexer: bool = False,
     ):
         print("=" * 60)
         print("🔍 Azure AI Search Setup")
@@ -471,16 +665,21 @@ class SetupManager:
                     await self.clean_article_content(config)
                 if clean_transcripts:
                     await self.clean_transcript_content(config)
+                if clean_scripts:
+                    await self.clean_script_content(config)
 
-            article_files, transcript_pairs = self.discover_inputs()
+            article_files, transcript_pairs, script_paths = self.discover_inputs(modified_since)
             transcript_state = self.load_transcript_state()
 
             print("\n🚀 Setting up Azure AI Search resources...")
-            search_info, embeddings, search_manager = await self.setup_azure_resources(config)
+            search_info, embeddings, search_manager, indexer_updated = await self.setup_azure_resources(
+                config, update_existing_indexer=update_existing_indexer
+            )
             indexer_name = f"{config['AZURE_SEARCH_INDEX_NAME']}-indexer"
             article_sync = {"uploaded": 0, "skipped": 0, "failed": 0}
             indexer_status = "not_needed"
             transcript_sync = {"uploaded": 0, "skipped": 0, "deleted": 0, "failed": 0}
+            script_sync = {"uploaded": 0, "skipped": 0, "deleted": 0, "failed": 0}
 
             if article_files:
                 article_sync = await self.upload_documents_to_blob(
@@ -488,7 +687,7 @@ class SetupManager:
                     config["AZURE_STORAGE_CONTAINER_NAME"],
                     self.iter_article_documents(article_files),
                 )
-                if article_sync["uploaded"] > 0 or clean:
+                if article_sync["uploaded"] > 0 or (clean and indexer_updated):
                     print("\n🔄 Processing article documents through skillset...")
                     indexer_status = await self.run_indexer(search_info, indexer_name)
                 else:
@@ -501,6 +700,9 @@ class SetupManager:
                     transcript_pairs,
                     transcript_state,
                 )
+            if script_paths:
+                print("\n🔄 Uploading script chunks...")
+                script_sync = await self.upload_script_chunks(search_manager, script_paths, transcript_state)
 
             print("\n🎉 Setup completed successfully!")
             print("=" * 60)
@@ -519,6 +721,11 @@ class SetupManager:
                 f"{transcript_sync['deleted']} old chunk(s) deleted, "
                 f"{transcript_sync['failed']} failed"
             )
+            print(
+                "Script sync: "
+                f"{script_sync['uploaded']} document(s) uploaded, {script_sync['skipped']} skipped, "
+                f"{script_sync['deleted']} old chunk(s) deleted, {script_sync['failed']} failed"
+            )
             print("=" * 60)
 
         except ConfigurationError as exc:
@@ -526,6 +733,7 @@ class SetupManager:
             sys.exit(1)
         except Exception as exc:
             print(f"❌ Setup failed: {exc}")
+            traceback.print_exc()
             sys.exit(1)
 
 
@@ -537,6 +745,16 @@ async def main():
         help="Delete all existing blobs, search index resources, and transcript ingest state before setup.",
     )
     parser.add_argument(
+        "--modified-today",
+        action="store_true",
+        help="Only ingest files modified since 00:00 UTC today.",
+    )
+    parser.add_argument(
+        "--update-existing-indexer",
+        action="store_true",
+        help="Explicitly replace the existing Azure indexer, data source, and skillset definitions.",
+    )
+    parser.add_argument(
         "--clean-articles",
         action="store_true",
         help="Delete existing article blobs and indexed article chunks before setup.",
@@ -546,13 +764,25 @@ async def main():
         action="store_true",
         help="Delete indexed transcript chunks and local transcript ingest state before setup.",
     )
+    parser.add_argument(
+        "--clean-scripts",
+        action="store_true",
+        help="Delete indexed script chunks and local script ingest state before setup.",
+    )
     args = parser.parse_args()
 
     setup_manager = SetupManager()
+    modified_since = (
+        datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        if args.modified_today else None
+    )
     await setup_manager.run_setup(
         clean=args.clean,
         clean_articles=args.clean_articles,
         clean_transcripts=args.clean_transcripts,
+        clean_scripts=args.clean_scripts,
+        modified_since=modified_since,
+        update_existing_indexer=args.update_existing_indexer,
     )
 
 

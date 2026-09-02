@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 MODULE_PATH = (
-    Path(__file__).resolve().parent.parent / "examples" / "export_brightspot_recent_articles.py"
+    Path(__file__).resolve().parent.parent / "scripts" / "export_brightspot_recent_articles.py"
 )
 SPEC = importlib.util.spec_from_file_location("export_brightspot_recent_articles", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)

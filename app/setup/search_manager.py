@@ -4,6 +4,7 @@ from typing import Callable, Dict, List, Optional
 
 import aiohttp
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import ResourceNotFoundError
 from azure.search.documents.indexes.aio import SearchIndexerClient
 from azure.search.documents.indexes.models import (
     AzureOpenAIEmbeddingSkill,
@@ -84,6 +85,7 @@ class SearchManager:
                     SearchableField(name="content", type="Edm.String", analyzer_name="standard.lucene"),
                     SearchableField(name="chunk_text", type="Edm.String", analyzer_name="standard.lucene"),
                     SearchableField(name="search_text", type="Edm.String", analyzer_name="standard.lucene"),
+                    SimpleField(name="raw_vtt_excerpt", type="Edm.String", retrievable=True),
                     SearchableField(name="headline", type="Edm.String", analyzer_name="standard.lucene"),
                     SearchableField(name="title", type="Edm.String", analyzer_name="standard.lucene"),
                     SearchableField(name="description", type="Edm.String", analyzer_name="standard.lucene"),
@@ -109,6 +111,13 @@ class SearchManager:
                         vector_search_profile_name="embedding_config",
                     ),
                     SimpleField(name="url", type="Edm.String"),
+                    SimpleField(
+                        name="source_id",
+                        type="Edm.String",
+                        filterable=True,
+                        facetable=True,
+                        retrievable=True,
+                    ),
                     SimpleField(
                         name="authors",
                         type="Collection(Edm.String)",
@@ -269,6 +278,23 @@ class SearchManager:
                     f"{existing_dimensions}-dimensional vectors, but the configured "
                     f"embedding deployment uses {self.embedding_dimensions}."
                 )
+            existing_field_names = {field.name for field in existing_index.fields}
+            fields_to_add = []
+            if "raw_vtt_excerpt" not in existing_field_names:
+                fields_to_add.append(SimpleField(name="raw_vtt_excerpt", type="Edm.String", retrievable=True))
+            if "source_id" not in existing_field_names:
+                fields_to_add.append(
+                    SimpleField(
+                        name="source_id",
+                        type="Edm.String",
+                        filterable=True,
+                        facetable=True,
+                        retrievable=True,
+                    )
+                )
+            if fields_to_add:
+                existing_index.fields.extend(fields_to_add)
+                await search_index_client.create_or_update_index(existing_index)
 
     async def create_blob_data_source(self):
         data_source_name = f"{self.search_info.index_name}-blob-ds"
@@ -333,6 +359,7 @@ class SearchManager:
                             source="/document/pages/*/content_vector",
                         ),
                         InputFieldMappingEntry(name="url", source="/document/url"),
+                        InputFieldMappingEntry(name="source_id", source="/document/source_id"),
                         InputFieldMappingEntry(name="authors", source="/document/authors"),
                         InputFieldMappingEntry(
                             name="author_search_text",
@@ -414,12 +441,25 @@ class SearchManager:
         )
         return indexer, indexer_name
 
-    async def setup(self):
+    async def setup(self, *, update_existing_indexer: bool = False):
         ds_client = SearchIndexerClient(
             endpoint=self.search_info.endpoint,
             credential=self.search_info.credential,
         )
         try:
+            indexer_name = f"{self.search_info.index_name}-indexer"
+            if not update_existing_indexer:
+                try:
+                    await ds_client.get_indexer(indexer_name)
+                except ResourceNotFoundError:
+                    pass
+                else:
+                    logger.info(
+                        "Preserving existing indexer %s; pass update_existing_indexer=True to replace it.",
+                        indexer_name,
+                    )
+                    return indexer_name, False
+
             data_source, data_source_name = await self.create_blob_data_source()
             await ds_client.create_or_update_data_source_connection(data_source)
 
@@ -431,7 +471,7 @@ class SearchManager:
                 data_source_name,
             )
             await ds_client.create_or_update_indexer(indexer)
-            return indexer_name
+            return indexer_name, True
         finally:
             await ds_client.close()
 
@@ -455,7 +495,13 @@ class SearchManager:
             except Exception:
                 pass
 
-    async def list_chunk_ids(self, filter_expression: str) -> List[str]:
+    async def _list_chunk_ids_page(
+        self,
+        filter_expression: str,
+        *,
+        last_chunk_id: Optional[str] = None,
+        page_size: int = 1000,
+    ) -> List[str]:
         if not isinstance(self.search_info.credential, AzureKeyCredential):
             raise TypeError("Chunk lookup currently requires an AzureKeyCredential.")
 
@@ -469,37 +515,48 @@ class SearchManager:
             "api-key": self.search_info.credential.key,
         }
 
-        chunk_ids: List[str] = []
-        skip = 0
-        page_size = 1000
-        while True:
-            payload = {
-                "search": "*",
-                "filter": filter_expression,
-                "select": "chunk_id",
-                "top": page_size,
-                "skip": skip,
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    headers=headers,
-                    data=json.dumps(payload).encode("utf-8"),
-                ) as response:
-                    if response.status == 404:
-                        return []
-                    if response.status >= 400:
-                        raise RuntimeError(
-                            "Failed to list chunks from Azure Search: "
-                            f"{response.status} {await response.text()}"
-                        )
-                    body = await response.json()
+        page_filter = filter_expression
+        if last_chunk_id is not None:
+            safe_last_chunk_id = last_chunk_id.replace("'", "''")
+            page_filter = f"({filter_expression}) and chunk_id gt '{safe_last_chunk_id}'"
+        payload = {
+            "search": "*",
+            "filter": page_filter,
+            "select": "chunk_id",
+            "top": page_size,
+            "orderby": "chunk_id asc",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers=headers,
+                data=json.dumps(payload).encode("utf-8"),
+            ) as response:
+                if response.status == 404:
+                    return []
+                if response.status >= 400:
+                    raise RuntimeError(
+                        "Failed to list chunks from Azure Search: "
+                        f"{response.status} {await response.text()}"
+                    )
+                body = await response.json()
 
-            page_ids = [item["chunk_id"] for item in body.get("value", []) if item.get("chunk_id")]
+        return [item["chunk_id"] for item in body.get("value", []) if item.get("chunk_id")]
+
+    async def list_chunk_ids(self, filter_expression: str) -> List[str]:
+        chunk_ids: List[str] = []
+        page_size = 1000
+        last_chunk_id: Optional[str] = None
+        while True:
+            page_ids = await self._list_chunk_ids_page(
+                filter_expression,
+                last_chunk_id=last_chunk_id,
+                page_size=page_size,
+            )
             chunk_ids.extend(page_ids)
             if len(page_ids) < page_size:
                 break
-            skip += page_size
+            last_chunk_id = page_ids[-1]
 
         return chunk_ids
 
@@ -552,13 +609,37 @@ class SearchManager:
         return len(chunk_ids)
 
     async def delete_transcript_chunks(self, parent_id: str) -> int:
-        chunk_ids = await self.list_chunk_ids_by_parent(parent_id)
-        return await self.delete_chunks(chunk_ids)
+        safe_parent_id = parent_id.replace("'", "''")
+        return await self.delete_chunks_by_filter(
+            f"parent_id eq '{safe_parent_id}'",
+            description=f"parent_id={parent_id}",
+        )
 
     async def delete_chunks_by_content_type(self, content_type: str) -> int:
         safe_content_type = content_type.replace("'", "''")
-        chunk_ids = await self.list_chunk_ids(f"content_type eq '{safe_content_type}'")
-        return await self.delete_chunks(chunk_ids)
+        return await self.delete_chunks_by_filter(
+            f"content_type eq '{safe_content_type}'",
+            description=f"{content_type}",
+        )
+
+    async def delete_chunks_by_filter(self, filter_expression: str, *, description: str = "matching") -> int:
+        total_deleted = 0
+        page_size = 1000
+        last_chunk_id: Optional[str] = None
+        while True:
+            page_ids = await self._list_chunk_ids_page(
+                filter_expression,
+                last_chunk_id=last_chunk_id,
+                page_size=page_size,
+            )
+            if not page_ids:
+                break
+            last_chunk_id = page_ids[-1]
+            total_deleted += await self.delete_chunks(page_ids)
+            print(f"   Deleted {total_deleted} {description} chunk(s)...", flush=True)
+            if len(page_ids) < page_size:
+                break
+        return total_deleted
 
     async def upload_transcript_chunks(
         self,

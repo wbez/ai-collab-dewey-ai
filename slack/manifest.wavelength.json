@@ -1,0 +1,68 @@
+{
+  "display_information": {
+    "name": "Wavelength",
+    "description": "Searches newsroom archive material from Slackbot."
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": true,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "Wavelength",
+      "always_online": true
+    },
+    "agent_view": {
+      "agent_description": "Searches newsroom archive material from Slack.",
+      "suggested_prompts": [
+        {
+          "title": "Find recent coverage",
+          "message": "Find recent coverage of CTA funding."
+        },
+        {
+          "title": "Summarize archive history",
+          "message": "Summarize our archive coverage of this topic over the last year."
+        }
+      ]
+    },
+    "slash_commands": [
+      {
+        "command": "/wavelength",
+        "url": "http://40.82.177.216:9999/slack/commands/wavelength",
+        "description": "Ask Wavelength to search the newsroom archive.",
+        "usage_hint": "Find coverage of CTA funding in 2024",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "assistant:write",
+        "channels:history",
+        "chat:write",
+        "commands",
+        "groups:history",
+        "im:history",
+        "mpim:history",
+        "users:read",
+        "users:read.email"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "http://40.82.177.216:9999/slack/events",
+      "bot_events": [
+        "app_mention",
+        "app_home_opened",
+        "message.im"
+      ]
+    },
+    "org_deploy_enabled": true,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

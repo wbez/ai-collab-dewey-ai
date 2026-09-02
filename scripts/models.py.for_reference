@@ -1,0 +1,224 @@
+"""SQLAlchemy models for the V2 content database."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+
+from content_db_v2.db import Base, JSON_VARIANT
+
+
+class Site(Base):
+    """A Brightspot site record."""
+
+    __tablename__ = "sites"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    name: Mapped[Optional[str]] = mapped_column(Text)
+    source_payload: Mapped[Optional[dict]] = mapped_column(JSON_VARIANT)
+
+
+class ContentGroup(Base):
+    """Logical Brightspot content family derived from root/source pointers."""
+
+    __tablename__ = "content_groups"
+
+    group_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    root_id: Mapped[Optional[str]] = mapped_column(Text)
+    source_id: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class Section(Base):
+    """A section referenced by articles."""
+
+    __tablename__ = "sections"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    site_id: Mapped[Optional[str]] = mapped_column(ForeignKey("sites.id"))
+    display_name: Mapped[Optional[str]] = mapped_column(Text)
+    resolved_display_name: Mapped[Optional[str]] = mapped_column(Text)
+    internal_name: Mapped[Optional[str]] = mapped_column(Text)
+    hidden: Mapped[Optional[bool]] = mapped_column(Boolean)
+    parent_section_id: Mapped[Optional[str]] = mapped_column(ForeignKey("sections.id"))
+    source_payload: Mapped[Optional[dict]] = mapped_column(JSON_VARIANT)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class Author(Base):
+    """An author referenced by articles."""
+
+    __tablename__ = "authors"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    name: Mapped[Optional[str]] = mapped_column(Text)
+    first_name: Mapped[Optional[str]] = mapped_column(Text)
+    last_name: Mapped[Optional[str]] = mapped_column(Text)
+    title: Mapped[Optional[str]] = mapped_column(Text)
+    email: Mapped[Optional[str]] = mapped_column(Text)
+    source_payload: Mapped[Optional[dict]] = mapped_column(JSON_VARIANT)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class Article(Base):
+    """The latest known state of a Brightspot article object."""
+
+    __tablename__ = "articles"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    group_key: Mapped[str] = mapped_column(ForeignKey("content_groups.group_key"))
+    site_id: Mapped[Optional[str]] = mapped_column(ForeignKey("sites.id"))
+    headline: Mapped[Optional[str]] = mapped_column(Text)
+    subheadline_raw_html: Mapped[Optional[str]] = mapped_column(Text)
+    subheadline_text: Mapped[Optional[str]] = mapped_column(Text)
+    body_raw_html: Mapped[Optional[str]] = mapped_column(Text)
+    body_text: Mapped[Optional[str]] = mapped_column(Text)
+    slug: Mapped[Optional[str]] = mapped_column(Text)
+    rss_guid: Mapped[Optional[str]] = mapped_column(Text)
+    create_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    update_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    publish_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    schedule_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    original_published_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    print_publication_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    draft: Mapped[Optional[bool]] = mapped_column(Boolean)
+    scheduled: Mapped[Optional[bool]] = mapped_column(Boolean)
+    is_under_embargo: Mapped[Optional[bool]] = mapped_column(Boolean)
+    embargo_type: Mapped[Optional[str]] = mapped_column(Text)
+    embargo_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    embargo_id: Mapped[Optional[str]] = mapped_column(Text)
+    hide_email_wall: Mapped[Optional[bool]] = mapped_column(Boolean)
+    airtable_record_id: Mapped[Optional[str]] = mapped_column(Text)
+    lead_type: Mapped[Optional[str]] = mapped_column(Text)
+    lead_image_asset_id: Mapped[Optional[str]] = mapped_column(Text)
+    lead_image_url: Mapped[Optional[str]] = mapped_column(Text)
+    lead_gallery_id: Mapped[Optional[str]] = mapped_column(Text)
+    lead_embed_url: Mapped[Optional[str]] = mapped_column(Text)
+    content_hash: Mapped[Optional[str]] = mapped_column(Text)
+    source_payload: Mapped[Optional[dict]] = mapped_column(JSON_VARIANT)
+    last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ArticleVersion(Base):
+    """Version snapshots for each article object."""
+
+    __tablename__ = "article_versions"
+    __table_args__ = (UniqueConstraint("article_id", "version_id", name="uq_article_versions_article_id_version_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    article_id: Mapped[str] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"))
+    version_id: Mapped[str] = mapped_column(Text)
+    root_id: Mapped[Optional[str]] = mapped_column(Text)
+    source_id: Mapped[Optional[str]] = mapped_column(Text)
+    headline: Mapped[Optional[str]] = mapped_column(Text)
+    subheadline_raw_html: Mapped[Optional[str]] = mapped_column(Text)
+    subheadline_text: Mapped[Optional[str]] = mapped_column(Text)
+    body_raw_html: Mapped[Optional[str]] = mapped_column(Text)
+    body_text: Mapped[Optional[str]] = mapped_column(Text)
+    slug: Mapped[Optional[str]] = mapped_column(Text)
+    rss_guid: Mapped[Optional[str]] = mapped_column(Text)
+    create_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    update_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    publish_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    schedule_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    original_published_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    print_publication_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    draft: Mapped[Optional[bool]] = mapped_column(Boolean)
+    scheduled: Mapped[Optional[bool]] = mapped_column(Boolean)
+    is_under_embargo: Mapped[Optional[bool]] = mapped_column(Boolean)
+    embargo_type: Mapped[Optional[str]] = mapped_column(Text)
+    embargo_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    embargo_id: Mapped[Optional[str]] = mapped_column(Text)
+    hide_email_wall: Mapped[Optional[bool]] = mapped_column(Boolean)
+    airtable_record_id: Mapped[Optional[str]] = mapped_column(Text)
+    lead_type: Mapped[Optional[str]] = mapped_column(Text)
+    lead_image_asset_id: Mapped[Optional[str]] = mapped_column(Text)
+    lead_image_url: Mapped[Optional[str]] = mapped_column(Text)
+    lead_gallery_id: Mapped[Optional[str]] = mapped_column(Text)
+    lead_embed_url: Mapped[Optional[str]] = mapped_column(Text)
+    content_hash: Mapped[Optional[str]] = mapped_column(Text)
+    source_payload: Mapped[Optional[dict]] = mapped_column(JSON_VARIANT)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ArticlePrimarySection(Base):
+    """Primary section assignments."""
+
+    __tablename__ = "article_primary_sections"
+
+    article_id: Mapped[str] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), primary_key=True)
+    section_id: Mapped[str] = mapped_column(ForeignKey("sections.id"), primary_key=True)
+
+
+class ArticleSecondarySection(Base):
+    """Secondary section assignments in source order."""
+
+    __tablename__ = "article_secondary_sections"
+
+    article_id: Mapped[str] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), primary_key=True)
+    section_id: Mapped[str] = mapped_column(ForeignKey("sections.id"), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class ArticleSectionAncestor(Base):
+    """Section ancestors in source order."""
+
+    __tablename__ = "article_section_ancestors"
+
+    article_id: Mapped[str] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), primary_key=True)
+    section_id: Mapped[str] = mapped_column(ForeignKey("sections.id"), primary_key=True)
+    depth: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class ArticleAuthor(Base):
+    """Author assignments in source order."""
+
+    __tablename__ = "article_authors"
+
+    article_id: Mapped[str] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), primary_key=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("authors.id"), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class SyncRun(Base):
+    """Bookkeeping for CLI sync runs."""
+
+    __tablename__ = "sync_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    processed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    hydrated_sections: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    hydrated_authors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_text: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class SyncState(Base):
+    """Watermark state for incremental sync commands."""
+
+    __tablename__ = "sync_state"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    watermark: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BackfillWindow(Base):
+    """Persistent backfill work units for resumable historical syncs."""
+
+    __tablename__ = "backfill_windows"
+    __table_args__ = (
+        UniqueConstraint("start_update_date", "end_update_date", name="uq_backfill_windows_start_end"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    start_update_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_update_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

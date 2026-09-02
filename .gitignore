@@ -221,4 +221,17 @@ __marimo__/
 
 .env.docker
 data/*.json
+bolt-python-assistant-template
+bolt-python-assistant-template/
+
+tmp/
 data/*.vtt
+slack-docs/
+data/scripts/*
+certs/
+app/data/wavelength-state.sqlite3
+PLAN.md
+TODO.md
+data/wavelength-state.sqlite3
+
+

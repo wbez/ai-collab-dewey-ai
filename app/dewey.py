@@ -1,10 +1,19 @@
 import html
 import json
 import re
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Dict, List, Optional
 
+try:
+    from azure.core.exceptions import HttpResponseError, ServiceRequestError
+except ImportError:  # pragma: no cover - test stubs or minimal local environments
+    class HttpResponseError(Exception):
+        pass
+
+    class ServiceRequestError(Exception):
+        pass
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import QueryType, VectorQuery, VectorizedQuery
@@ -93,11 +102,11 @@ class Dewey:
         finally:
             step["status"] = "done"
 
-    def generate_metadata(self, messages, current_date: str):
+    def generate_metadata(self, messages, current_date: str, assistant_name: str = "Dewey"):
         response = self.oai_client.responses.create(
             model=self.openai_config.chat_deployment,
             input=messages,
-            instructions=load_search_prompt(current_date),
+            instructions=load_search_prompt(current_date, assistant_name=assistant_name),
             tools=[load_search_tool()],
             tool_choice={"type": "function", "name": "search_archive"},
         )
@@ -118,7 +127,7 @@ class Dewey:
         content_type_filters = [
             f"content_type eq '{self._escape_odata_string(value)}'"
             for value in content_types
-            if value in {"article", "transcript"}
+            if value in {"article", "transcript", "script"}
         ]
         if content_type_filters:
             filters.append(f"({' or '.join(content_type_filters)})")
@@ -167,10 +176,14 @@ class Dewey:
         semantic_query: Optional[str] = None,
         search_fields: Optional[List[str]] = None,
     ):
+        search_top = metadata.get("search_top") if isinstance(metadata, dict) else None
+        if not isinstance(search_top, int) or isinstance(search_top, bool):
+            search_top = 10
+        search_top = max(1, min(search_top, 100))
         search_kwargs = {
             "search_text": search_text,
             "filter": filter_text,
-            "top": 10,
+            "top": search_top,
             "select": [
                 "url",
                 "headline",
@@ -178,8 +191,11 @@ class Dewey:
                 "publish_date",
                 "content",
                 "chunk_text",
+                "raw_vtt_excerpt",
                 "authors",
                 "content_type",
+                "source_id",
+                "sourcepage",
                 "citation_url",
                 "occurrence_id",
                 "transcript_name",
@@ -202,13 +218,19 @@ class Dewey:
             search_kwargs["semantic_query"] = semantic_query
         if search_fields:
             search_kwargs["search_fields"] = search_fields
-        return list(self.search_client.search(**search_kwargs))
+        if metadata.get("sort") in {"newest", "oldest"}:
+            direction = "desc" if metadata["sort"] == "newest" else "asc"
+            search_kwargs["order_by"] = [f"publish_date {direction}"]
+        return self._retry("azure_search", lambda: list(self.search_client.search(**search_kwargs)))
 
     def _build_vector_query(self, metadata: Dict[str, object]) -> List[VectorQuery]:
-        embedding = self.oai_client.embeddings.create(
-            model=self.openai_config.embedding_deployment,
-            input=metadata["question"],
-            dimensions=self.openai_config.embedding_dimensions,
+        embedding = self._retry(
+            "azure_openai_embeddings",
+            lambda: self.oai_client.embeddings.create(
+                model=self.openai_config.embedding_deployment,
+                input=metadata["question"],
+                dimensions=self.openai_config.embedding_dimensions,
+            ),
         )
         return [
             VectorizedQuery(
@@ -217,6 +239,43 @@ class Dewey:
                 fields="content_vector",
             )
         ]
+
+    def _retry(self, label: str, fn, *, attempts: int = 3, base_sleep_s: float = 0.4):
+        """Best-effort retry for transient upstream/network errors.
+
+        Slack requests should stay responsive, so keep retries short.
+        """
+
+        def should_retry(exc: BaseException) -> bool:
+            if isinstance(exc, (ServiceRequestError, HttpResponseError)):
+                return True
+            msg = str(exc).lower()
+            return any(
+                token in msg
+                for token in (
+                    "connection reset by peer",
+                    "upstream connect error",
+                    "disconnect/reset before headers",
+                    "tls_error",
+                    "temporarily unavailable",
+                    "timeout",
+                    "timed out",
+                    "remote connection failure",
+                )
+            )
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                return fn()
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts or not should_retry(exc):
+                    raise
+                sleep_s = base_sleep_s * (2 ** (attempt - 1))
+                time.sleep(sleep_s)
+        if last_exc:
+            raise last_exc
 
     def _build_fuzzy_query(self, metadata: Dict[str, object]) -> Optional[str]:
         clauses: List[str] = []
@@ -287,6 +346,9 @@ class Dewey:
                 "content": (content or "").replace("\n", " ").replace("\r", " "),
             }
             if source_payload["content_type"] == "transcript":
+                raw_vtt_excerpt = page.get("raw_vtt_excerpt")
+                if raw_vtt_excerpt:
+                    source_payload["raw_vtt_excerpt"] = raw_vtt_excerpt
                 speakers = page.get("speakers") or []
                 if speakers:
                     source_payload["speakers"] = speakers
@@ -363,15 +425,29 @@ class Dewey:
         )
 
     def _retrieve_documents(self, metadata):
-        vectors = self._build_vector_query(metadata)
+        chronological_sort = metadata.get("sort") in {"newest", "oldest"}
+        if metadata.get("search_mode") == "keyword":
+            return self._search_documents(
+                metadata,
+                search_text=metadata["question"],
+                filter_text=self.build_filter(metadata, include_exact_names=True),
+                vector_queries=None,
+                query_type=QueryType.FULL,
+                search_fields=["search_text", "author_search_text", "speaker_search_text"],
+            )
+        vectors = None if chronological_sort else self._build_vector_query(metadata)
         exact_filter = self.build_filter(metadata, include_exact_names=True)
         results = self._search_documents(
             metadata,
             search_text=metadata["question"],
             filter_text=exact_filter,
             vector_queries=vectors,
-            query_type=QueryType.SEMANTIC,
-            semantic_query=metadata["question"],
+            # Azure AI Search does not allow semantic ranking and field
+            # ordering in one request. Date-ordered queries intentionally use
+            # full-text matching plus filters; relevance queries stay hybrid
+            # semantic/vector searches.
+            query_type=QueryType.FULL if chronological_sort else QueryType.SEMANTIC,
+            semantic_query=None if chronological_sort else metadata["question"],
         )
 
         has_fuzzy_names = bool(metadata.get("authors") or metadata.get("speakers"))
@@ -401,6 +477,32 @@ class Dewey:
 
     def retrieve_articles(self, metadata):
         return self._format_sources(self._retrieve_documents(metadata))
+
+    def retrieve_documents(self, metadata):
+        return self._retrieve_documents(metadata)
+
+    def get_source(self, source_id: str):
+        escaped_source_id = self._escape_odata_string(str(source_id).strip())
+        if not escaped_source_id:
+            return None
+        filter_text = (
+            f"chunk_id eq '{escaped_source_id}' or "
+            f"occurrence_id eq '{escaped_source_id}' or "
+            f"parent_id eq '{escaped_source_id}'"
+        )
+        results = self._search_documents(
+            {},
+            search_text="*",
+            filter_text=filter_text,
+            vector_queries=None,
+        )
+        return results[0] if results else None
+
+    def format_sources(self, results):
+        return self._format_sources(results)
+
+    def build_source_url_map(self, results) -> Dict[int, Optional[str]]:
+        return self._build_source_url_map(results)
 
     def process(self, message: str, history: List, show_steps: bool = True):
         self._current_steps = []

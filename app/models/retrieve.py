@@ -18,7 +18,7 @@ class SearchParams(BaseModel):
     authors: List[NamedEntity] = Field(default_factory=list, description="authors")
     speakers: List[NamedEntity] = Field(default_factory=list, description="speakers")
     guests: List[NamedEntity] = Field(default_factory=list, description="guests")
-    content_types: List[Literal["article", "transcript"]] = Field(
+    content_types: List[Literal["article", "transcript", "script"]] = Field(
         default_factory=list,
         description="content_types",
     )

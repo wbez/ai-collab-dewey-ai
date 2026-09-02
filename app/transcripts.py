@@ -1,4 +1,3 @@
-import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -13,9 +12,9 @@ except ImportError:  # pragma: no cover - local fallback for environments withou
     tiktoken = None
 
 
-MIN_CHUNK_TOKENS = 120
-MAX_CHUNK_TOKENS = 512
-TARGET_CHUNK_TOKENS = 500
+MIN_CHUNK_TOKENS = 240
+MAX_CHUNK_TOKENS = 1024
+TARGET_CHUNK_TOKENS = 1000
 
 NOTE_PATTERN = re.compile(r"^NOTE\s+([^:]+):\s*(.+?)\s*$")
 TIMESTAMP_PATTERN = re.compile(
@@ -45,6 +44,7 @@ class TranscriptCue:
     end_seconds: float
     speaker: Optional[str]
     text: str
+    raw_vtt_excerpt: str
 
 
 def normalize_whitespace(value: str) -> str:
@@ -91,6 +91,7 @@ def load_vtt(path: Path) -> tuple[Dict[str, str], List[TranscriptCue]]:
     notes: Dict[str, str] = {}
     cues: List[TranscriptCue] = []
     current_timing: Optional[re.Match[str]] = None
+    current_timing_line: Optional[str] = None
     text_lines: List[str] = []
 
     for raw_line in path.read_text(encoding="utf-8").splitlines():
@@ -104,8 +105,9 @@ def load_vtt(path: Path) -> tuple[Dict[str, str], List[TranscriptCue]]:
 
         if timing_match:
             if current_timing and text_lines:
-                cues.append(_build_cue(current_timing, text_lines))
+                cues.append(_build_cue(current_timing, current_timing_line or "", text_lines))
             current_timing = timing_match
+            current_timing_line = line.strip()
             text_lines = []
             continue
 
@@ -113,17 +115,18 @@ def load_vtt(path: Path) -> tuple[Dict[str, str], List[TranscriptCue]]:
             if line.strip():
                 text_lines.append(line.strip())
             elif text_lines:
-                cues.append(_build_cue(current_timing, text_lines))
+                cues.append(_build_cue(current_timing, current_timing_line or "", text_lines))
                 current_timing = None
+                current_timing_line = None
                 text_lines = []
 
     if current_timing and text_lines:
-        cues.append(_build_cue(current_timing, text_lines))
+        cues.append(_build_cue(current_timing, current_timing_line or "", text_lines))
 
     return notes, cues
 
 
-def _build_cue(timing_match: re.Match[str], text_lines: List[str]) -> TranscriptCue:
+def _build_cue(timing_match: re.Match[str], timing_line: str, text_lines: List[str]) -> TranscriptCue:
     raw_text = normalize_whitespace(" ".join(text_lines))
     speaker, text = extract_speaker(raw_text)
     return TranscriptCue(
@@ -131,6 +134,7 @@ def _build_cue(timing_match: re.Match[str], text_lines: List[str]) -> Transcript
         end_seconds=parse_timestamp(timing_match.group("end")),
         speaker=speaker,
         text=text,
+        raw_vtt_excerpt="\n".join([timing_line, *text_lines]).strip(),
     )
 
 
@@ -335,6 +339,7 @@ def load_transcript_document(vtt_path: Path, metadata_path: Path) -> Dict[str, A
         "recording_files": recording_files,
         "guests": [normalize_whitespace(guest) for guest in guests if normalize_whitespace(guest)],
         "cues": cues,
+        "sourcepage": vtt_path.name,
     }
 
 
@@ -353,10 +358,11 @@ def _metadata_from_notes(notes: Dict[str, str]) -> Dict[str, Any]:
     return metadata
 
 
-def build_transcript_chunks(document: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_transcript_chunks(document: Dict[str, Any], source_hash: Optional[str] = None) -> List[Dict[str, Any]]:
     turns = _merge_cues_into_turns(document["cues"])
     chunks = _merge_turns_into_chunks(turns)
     chunk_documents: List[Dict[str, Any]] = []
+    parent_id = source_hash or str(document["id"])
 
     for index, chunk in enumerate(chunks):
         speakers = [speaker for speaker in chunk["speakers"] if speaker]
@@ -368,15 +374,10 @@ def build_transcript_chunks(document: Dict[str, Any]) -> List[Dict[str, Any]]:
             speakers=speakers,
             content=chunk["content"],
         )
-        fingerprint = hashlib.md5(
-            f"{document['id']}:{chunk['start_seconds']}:{chunk['end_seconds']}:{chunk['content']}".encode(
-                "utf-8"
-            )
-        ).hexdigest()[:12]
         chunk_documents.append(
             {
-                "chunk_id": f"{document['id']}-{index:04d}-{fingerprint}",
-                "parent_id": document["id"],
+                "chunk_id": f"{parent_id}-{index}",
+                "parent_id": parent_id,
                 "occurrence_id": document.get("occurrence_id"),
                 "content_type": "transcript",
                 "title": document["title"],
@@ -397,8 +398,11 @@ def build_transcript_chunks(document: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "end_seconds": chunk["end_seconds"],
                 "publish_date": document.get("recording_date"),
                 "recording_date": document.get("recording_date"),
+                "content": chunk["content"],
                 "chunk_text": chunk["content"],
                 "search_text": search_text,
+                "raw_vtt_excerpt": chunk["raw_vtt_excerpt"],
+                "sourcepage": document.get("sourcepage"),
                 "authors": [],
             }
         )
@@ -416,6 +420,7 @@ def _merge_cues_into_turns(cues: List[TranscriptCue]) -> List[Dict[str, Any]]:
         ):
             turns[-1]["end_seconds"] = cue.end_seconds
             turns[-1]["texts"].append(cue.text)
+            turns[-1]["raw_vtt_excerpts"].append(cue.raw_vtt_excerpt)
             turns[-1]["cue_starts"].append(cue.start_seconds)
             continue
         turns.append(
@@ -424,12 +429,14 @@ def _merge_cues_into_turns(cues: List[TranscriptCue]) -> List[Dict[str, Any]]:
                 "start_seconds": cue.start_seconds,
                 "end_seconds": cue.end_seconds,
                 "texts": [cue.text],
+                "raw_vtt_excerpts": [cue.raw_vtt_excerpt],
                 "cue_starts": [cue.start_seconds],
             }
         )
 
     for turn in turns:
         turn["content"] = normalize_whitespace(" ".join(turn.pop("texts")))
+        turn["raw_vtt_excerpt"] = "\n\n".join(turn.pop("raw_vtt_excerpts"))
         turn["token_count"] = count_tokens(turn["content"])
         turn["speakers"] = [turn["speaker"]] if turn["speaker"] else []
     return turns
@@ -467,6 +474,7 @@ def _clone_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
         "start_seconds": turn["start_seconds"],
         "end_seconds": turn["end_seconds"],
         "content": turn["content"],
+        "raw_vtt_excerpt": turn["raw_vtt_excerpt"],
         "speakers": list(turn["speakers"]),
         "cue_starts": list(turn["cue_starts"]),
         "token_count": turn["token_count"],
@@ -480,6 +488,9 @@ def _combine_units(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any
         "start_seconds": left["start_seconds"],
         "end_seconds": right["end_seconds"],
         "content": content,
+        "raw_vtt_excerpt": "\n\n".join(
+            value for value in [left.get("raw_vtt_excerpt"), right.get("raw_vtt_excerpt")] if value
+        ),
         "speakers": speakers,
         "cue_starts": left["cue_starts"] + right["cue_starts"],
         "token_count": count_tokens(content),
