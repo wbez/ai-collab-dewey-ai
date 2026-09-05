@@ -234,4 +234,4 @@ PLAN.md
 TODO.md
 data/wavelength-state.sqlite3
 
-
+*.sqlite3-*
