@@ -23,6 +23,7 @@ from slack_format import (
     search_blocks,
     slack_link_url,
     source_references,
+    truncate_text,
 )
 from search_plan import (
     DEFAULT_SEARCH_STEPS,
@@ -34,10 +35,18 @@ from tools import load_answer_prompt
 
 
 logger = logging.getLogger(__name__)
+CITATION_MARKER_PATTERN = re.compile(r"\{\{cite:(?P<key>c_[A-Za-z0-9]+)\}\}")
 
 
 def _verbose_logging_enabled() -> bool:
     return os.environ.get("WAVELENGTH_VERBOSE_LOGS") == "true"
+
+
+def _source_logging_enabled() -> bool:
+    return (
+        os.environ.get("WAVELENGTH_LOG_SOURCES") == "true"
+        or _verbose_logging_enabled()
+    )
 
 
 def _log_verbose(label: str, value: Any) -> None:
@@ -48,6 +57,241 @@ def _log_verbose(label: str, value: Any) -> None:
         label,
         json.dumps(value, indent=2, ensure_ascii=False, default=str),
     )
+
+
+def _source_summary(source: Dict[str, Any]) -> Dict[str, Any]:
+    passages = []
+    for passage in source.get("passages") or []:
+        if not isinstance(passage, dict):
+            continue
+        passages.append({
+            "passage_id": passage.get("passage_id"),
+            "passage_ids": passage.get("passage_ids") or [passage.get("passage_id")],
+            "start_seconds": passage.get("start_seconds"),
+            "end_seconds": passage.get("end_seconds"),
+            "speakers": passage.get("speakers") or [],
+        })
+    return {
+        "source_id": source.get("source_id") or source.get("id"),
+        "content_type": source.get("content_type"),
+        "title": source.get("title") or source.get("headline") or source.get("transcript_name"),
+        "published_at": source.get("published_at") or source.get("publish_date"),
+        "url": source.get("url") or source.get("canonical_url") or source.get("transcript_url"),
+        "program": source.get("program"),
+        "authors": source.get("authors") or [],
+        "speakers": source.get("speakers") or [],
+        "guests": source.get("guests") or [],
+        "passages": passages,
+    }
+
+
+def _log_sources(label: str, value: Any, *, level: int = logging.INFO) -> None:
+    if not _source_logging_enabled():
+        return
+    logger.log(
+        level,
+        "%s:\n%s",
+        label,
+        json.dumps(value, indent=2, ensure_ascii=False, default=str),
+    )
+
+
+def _citation_key(source_id: Any, passage_id: Any) -> str:
+    raw = f"{source_id or ''}\0{passage_id or ''}"
+    return "c_" + sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:8]
+
+
+def _citation_map_for_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        source_id = source.get("source_id") or source.get("id")
+        for passage in source.get("passages") or []:
+            if not isinstance(passage, dict):
+                continue
+            citation_key = passage.get("citation_key") or _citation_key(
+                source_id,
+                passage.get("passage_id"),
+            )
+            if citation_key in seen:
+                continue
+            seen.add(citation_key)
+            entries.append({
+                "citation_key": citation_key,
+                "source_id": source_id,
+                "passage_id": passage.get("passage_id"),
+                "passage_ids": passage.get("passage_ids") or [passage.get("passage_id")],
+                "content_type": source.get("content_type"),
+                "title": source.get("title") or source.get("headline") or source.get("transcript_name"),
+                "published_at": source.get("published_at") or source.get("publish_date"),
+                "url": source.get("url") or source.get("canonical_url") or source.get("transcript_url"),
+                "listen_url": passage.get("timestamp_url") or source.get("listen_url") or source.get("transcript_url"),
+                "program": source.get("program"),
+                "parent_id": source.get("parent_id"),
+                "occurrence_id": source.get("occurrence_id"),
+                "authors": source.get("authors") or [],
+                "speakers": passage.get("speakers") or source.get("speakers") or [],
+                "guests": source.get("guests") or [],
+                "start_seconds": passage.get("start_seconds"),
+                "end_seconds": passage.get("end_seconds"),
+                "excerpt": truncate_text(passage.get("text") or "", 1200),
+                "raw_vtt_excerpt": passage.get("raw_vtt_excerpt"),
+            })
+    return entries
+
+
+def _segment_citation_entry(
+    source: Dict[str, Any],
+    citation_key: str,
+    passage_id: str,
+) -> Dict[str, Any]:
+    return {
+        "citation_key": citation_key,
+        "source_id": source.get("source_id") or source.get("id"),
+        "passage_id": passage_id,
+        "passage_ids": [passage_id],
+        "content_type": source.get("content_type"),
+        "title": source.get("title") or source.get("headline") or source.get("transcript_name"),
+        "published_at": source.get("published_at") or source.get("publish_date"),
+        "url": source.get("url") or source.get("canonical_url") or source.get("transcript_url"),
+        "listen_url": source.get("listen_url") or source.get("transcript_url"),
+        "program": source.get("program"),
+        "parent_id": source.get("parent_id"),
+        "occurrence_id": source.get("occurrence_id"),
+        "authors": source.get("authors") or [],
+        "speakers": source.get("speakers") or [],
+        "guests": source.get("guests") or [],
+        "start_seconds": None,
+        "end_seconds": None,
+        "excerpt": truncate_text(source.get("content") or source.get("excerpt") or "", 1200),
+        "raw_vtt_excerpt": source.get("raw_vtt_excerpt"),
+    }
+
+
+def _source_from_citation_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source_id": entry.get("source_id"),
+        "content_type": entry.get("content_type"),
+        "title": entry.get("title") or "Untitled source",
+        "published_at": entry.get("published_at"),
+        "url": entry.get("url") or entry.get("listen_url"),
+        "listen_url": entry.get("listen_url"),
+        "program": entry.get("program"),
+        "parent_id": entry.get("parent_id"),
+        "occurrence_id": entry.get("occurrence_id"),
+        "authors": entry.get("authors") or [],
+        "speakers": entry.get("speakers") or [],
+        "guests": entry.get("guests") or [],
+        "content": entry.get("excerpt") or "",
+        "excerpt": entry.get("excerpt") or "",
+        "raw_vtt_excerpt": entry.get("raw_vtt_excerpt"),
+        "passages": [
+            {
+                "passage_id": entry.get("passage_id"),
+                "passage_ids": entry.get("passage_ids") or [entry.get("passage_id")],
+                "text": entry.get("excerpt") or "",
+                "raw_vtt_excerpt": entry.get("raw_vtt_excerpt"),
+                "start_seconds": entry.get("start_seconds"),
+                "end_seconds": entry.get("end_seconds"),
+                "timestamp_url": entry.get("listen_url"),
+            }
+        ],
+    }
+
+
+def _citation_map_summary(citation_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "citation_key": key,
+            "source_id": entry.get("source_id"),
+            "passage_id": entry.get("passage_id"),
+            "passage_ids": entry.get("passage_ids") or [],
+            "title": entry.get("title"),
+            "published_at": entry.get("published_at"),
+            "url": entry.get("url"),
+            "program": entry.get("program"),
+            "start_seconds": entry.get("start_seconds"),
+            "end_seconds": entry.get("end_seconds"),
+        }
+        for key, entry in citation_map.items()
+    ]
+
+
+def _answer_text_from_structured_answer(answer: Any) -> str:
+    if isinstance(answer, str):
+        return answer.strip()
+    if not isinstance(answer, dict):
+        return ""
+    text = answer.get("answer")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    # Backward-compatible fallback for earlier claim-shaped responses.
+    claims = answer.get("claims")
+    if isinstance(claims, list):
+        return "\n\n".join(
+            str(claim.get("text")).strip()
+            for claim in claims
+            if isinstance(claim, dict) and str(claim.get("text") or "").strip()
+        )
+    intro = answer.get("intro")
+    return str(intro).strip() if isinstance(intro, str) else ""
+
+
+def _uncited_claim_texts(answer: Any) -> List[str]:
+    if not isinstance(answer, dict) or not isinstance(answer.get("claims"), list):
+        return []
+    uncited = []
+    for claim in answer["claims"]:
+        if not isinstance(claim, dict):
+            continue
+        text = str(claim.get("text") or "").strip()
+        citations = claim.get("citations")
+        if text and isinstance(citations, list) and not citations:
+            uncited.append(text)
+    return uncited
+
+
+def resolve_inline_citations(
+    answer_text: str,
+    citation_map: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    source_refs: List[Dict[str, Any]] = []
+    number_by_key: Dict[str, int] = {}
+    number_by_source: Dict[str, int] = {}
+    unresolved_keys = []
+
+    def replace(match):
+        key = match.group("key")
+        entry = citation_map.get(key)
+        if not entry:
+            unresolved_keys.append(key)
+            return ""
+        source = _source_from_citation_entry(entry)
+        source_ref = source_references([source])[0]
+        source_identity = str(source_ref.get("source_id") or source_ref.get("url") or key)
+        number = number_by_source.get(source_identity)
+        if not number:
+            number = len(source_refs) + 1
+            number_by_source[source_identity] = number
+            source_refs.append({**source_ref, "number": number})
+        number_by_key[key] = number
+        return f"[{number}]"
+
+    rendered = CITATION_MARKER_PATTERN.sub(replace, answer_text)
+    rendered = re.sub(r"[ \t]{2,}", " ", rendered).strip()
+    rendered = re.sub(r"\s+([,.;:!?])", r"\1", rendered)
+    warnings = []
+    if unresolved_keys:
+        warnings.append("Some citation markers could not be resolved; answer text was preserved.")
+    return {
+        "answer": rendered,
+        "sources": source_refs,
+        "warnings": warnings,
+        "unresolved_citation_keys": sorted(set(unresolved_keys)),
+        "resolved_citation_keys": number_by_key,
+    }
 
 
 def _named_entities(values: Optional[List[Any]]) -> List[Dict[str, str]]:
@@ -155,6 +399,7 @@ def validate_citations(answer: Dict[str, Any], sources: Dict[str, Dict[str, Any]
     if not isinstance(claims, list):
         raise ValueError("structured answer must contain claims")
     valid_claims = []
+    rejected_citations = []
     for claim in claims:
         if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
             continue
@@ -162,14 +407,41 @@ def validate_citations(answer: Dict[str, Any], sources: Dict[str, Dict[str, Any]
         for citation in claim.get("citations") or []:
             if not isinstance(citation, dict):
                 continue
-            source = sources.get(str(citation.get("source_id")))
+            source_id = str(citation.get("source_id"))
+            source = sources.get(source_id)
             passage_ids = [str(value) for value in citation.get("passage_ids") or []]
-            known = {str(p.get("passage_id")) for p in (source or {}).get("passages", [])}
+            known = set()
+            for passage in (source or {}).get("passages", []):
+                if not isinstance(passage, dict):
+                    continue
+                passage_id = passage.get("passage_id")
+                if passage_id is not None:
+                    known.add(str(passage_id))
+                for merged_id in passage.get("passage_ids") or []:
+                    known.add(str(merged_id))
             if source and passage_ids and set(passage_ids) <= known:
-                citations.append({"source_id": str(citation["source_id"]), "passage_ids": passage_ids})
+                citations.append({"source_id": source_id, "passage_ids": passage_ids})
+            else:
+                if not source:
+                    reason = "unknown_source_id"
+                elif not passage_ids:
+                    reason = "missing_passage_ids"
+                else:
+                    reason = "unknown_passage_ids"
+                rejected_citations.append({
+                    "claim_text": claim["text"],
+                    "source_id": source_id,
+                    "passage_ids": passage_ids,
+                    "known_passage_ids": sorted(known),
+                    "reason": reason,
+                })
         if citations:
             valid_claims.append({"text": claim["text"], "citations": citations})
-    return {"intro": answer.get("intro") if isinstance(answer, dict) else None, "claims": valid_claims}
+    return {
+        "intro": answer.get("intro") if isinstance(answer, dict) else None,
+        "claims": valid_claims,
+        "_rejected_citations": rejected_citations,
+    }
 
 
 def _split_source_marker_safe_prefix(text: str) -> tuple[str, str]:
@@ -252,10 +524,8 @@ class WavelengthService:
     def structured_answer_schema() -> Dict[str, Any]:
         return {"type": "json_schema", "name": "wavelength_answer", "strict": True,
                 "schema": {"type": "object", "additionalProperties": False,
-                           "properties": {"intro": {"type": ["string", "null"]},
-                                          "claims": {"type": "array", "items": {"type": "object", "additionalProperties": False,
-                                            "properties": {"text": {"type": "string"}, "citations": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {"source_id": {"type": "string"}, "passage_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["source_id", "passage_ids"]}}}, "required": ["text", "citations"]}}},
-                           "required": ["intro", "claims"]}}
+                           "properties": {"answer": {"type": "string"}},
+                           "required": ["answer"]}}
 
     @staticmethod
     def responses_mcp_instructions(
@@ -299,10 +569,10 @@ class WavelengthService:
             if raw:
                 break
         if not raw:
-            raw = getattr(response, "output_text", "{\"intro\":null,\"claims\":[]}")
+            raw = getattr(response, "output_text", "{\"answer\":\"\"}")
         answer = json.loads(raw) if isinstance(raw, str) else raw
-        registry = {}
-        ordered_source_ids: List[str] = []
+        _log_sources("Responses structured answer output", answer)
+        citation_map: Dict[str, Dict[str, Any]] = {}
         mcp_calls = []
         for item in getattr(response, "output", []):
             if getattr(item, "type", "") == "mcp_call":
@@ -323,59 +593,75 @@ class WavelengthService:
                     except json.JSONDecodeError:
                         output = None
                 if isinstance(output, dict):
-                    for row in output.get("results", []) or []:
-                        if not isinstance(row, dict) or not row.get("source_id"):
+                    for entry in output.get("citation_map", []) or []:
+                        if not isinstance(entry, dict) or not entry.get("citation_key"):
                             continue
-                        source_id = str(row["source_id"])
-                        if source_id not in registry:
-                            ordered_source_ids.append(source_id)
-                        registry[source_id] = row
-        validated = validate_citations(answer, registry)
-        # The schema includes a free-form `intro` field, but it is not citation
-        # validated. To avoid uncited factual statements in Slack, we render
-        # only citation-validated claims.
-        validated["intro"] = None
-        sources = [self._display_source(source) for source in registry.values()]
-        all_source_refs = source_references(sources)
-        source_by_id = {str(ref["source_id"]): ref for ref in all_source_refs}
-        source_refs = []
-        number_by_id = {}
-        for claim in validated["claims"]:
-            for citation in claim["citations"]:
-                source_id = citation["source_id"]
-                if source_id not in number_by_id and source_id in source_by_id:
-                    number_by_id[source_id] = len(source_refs) + 1
-                    source_refs.append({**source_by_id[source_id], "number": len(source_refs) + 1})
-        if not source_refs and source_by_id:
-            # If the model output did not include valid citations, still attach
-            # the top retrieved sources so Slack can render cards and Work
-            # Object unfurls.
-            for source_id in (ordered_source_ids or list(source_by_id.keys())):
-                ref = source_by_id.get(str(source_id))
-                if not ref:
-                    continue
-                source_refs.append({**ref, "number": len(source_refs) + 1})
-                if len(source_refs) >= 10:
-                    break
-        rendered_claims = []
-        for claim in validated["claims"]:
-            labels = []
-            cited_numbers = set()
-            for citation in claim["citations"]:
-                number = number_by_id.get(citation["source_id"])
-                if number and number not in cited_numbers:
-                    cited_numbers.add(number)
-                    source = source_refs[number - 1]
-                    label = f"[{number}]"
-                    labels.append(label)
-            rendered_claims.append(claim["text"] + (" " + " ".join(labels) if labels else ""))
-        rendered = "\n\n".join(rendered_claims).strip()
+                        citation_map[str(entry["citation_key"])] = entry
+                    # Backward-compatible fallback for older MCP results that
+                    # have not yet emitted citation_map.
+                    result_sources = [
+                        row for row in output.get("results", []) or []
+                        if isinstance(row, dict)
+                    ]
+                    for entry in _citation_map_for_sources(result_sources):
+                        citation_map.setdefault(str(entry["citation_key"]), entry)
+        answer_text = _answer_text_from_structured_answer(answer)
+        uncited_claims = _uncited_claim_texts(answer)
+        resolved = resolve_inline_citations(answer_text, citation_map)
+        _log_sources(
+            "Responses citation map",
+            {
+                "citation_count": len(citation_map),
+                "citations": _citation_map_summary(citation_map),
+                "mcp_calls": mcp_calls,
+            },
+        )
+        if resolved["unresolved_citation_keys"]:
+            logger.warning(
+                "Could not resolve %d inline citation marker(s). "
+                "Set WAVELENGTH_LOG_SOURCES=true or start with --log-sources for details.",
+                len(resolved["unresolved_citation_keys"]),
+            )
+            _log_sources(
+                "Unresolved inline citation markers",
+                {
+                    "unresolved_citation_keys": resolved["unresolved_citation_keys"],
+                    "known_citation_keys": sorted(citation_map.keys()),
+                    "answer": answer_text,
+                },
+                level=logging.WARNING,
+            )
+        if uncited_claims:
+            logger.warning(
+                "Structured answer included %d uncited claim(s); preserving text.",
+                len(uncited_claims),
+            )
+            _log_sources(
+                "Uncited structured claims",
+                uncited_claims,
+                level=logging.WARNING,
+            )
+        rendered = resolved["answer"]
         if not rendered:
             rendered = "Here are the top archive sources I found:"
+        warnings = list(resolved["warnings"])
+        if uncited_claims:
+            warnings.append("Some structured claims had no citation markers; answer text was preserved.")
+        if warnings:
+            rendered = rendered + "\n\nWarning: " + " ".join(warnings)
+        slack_rendered = markdown_to_slack_mrkdwn(rendered)
         return block_kit_tool_result(
-            rendered,
-            answer_blocks(rendered, source_refs),
-            {**validated, "sources": source_refs, "mcp_calls": mcp_calls},
+            slack_rendered,
+            answer_blocks(rendered, resolved["sources"]),
+            {
+                "answer": slack_rendered,
+                "answer_markdown": rendered,
+                "sources": resolved["sources"],
+                "mcp_calls": mcp_calls,
+                "warnings": warnings,
+                "unresolved_citation_keys": resolved["unresolved_citation_keys"],
+                "uncited_claim_count": len(uncited_claims),
+            },
         )
 
     @classmethod
@@ -457,16 +743,18 @@ class WavelengthService:
 
         all_sources = source_references(results)
         sources = cited_source_references(answer, all_sources)
-        slack_answer = markdown_to_slack_mrkdwn(replace_source_markers(answer, source_urls, link_urls=False))
+        markdown_answer = replace_source_markers(answer, source_urls, link_urls=False)
+        slack_answer = markdown_to_slack_mrkdwn(markdown_answer)
         fallback = slack_answer or "Wavelength could not generate an answer from the retrieved sources."
         structured = {
             "answer": slack_answer,
+            "answer_markdown": markdown_answer,
             "sources": sources,
             "needs_clarification": "what time period" in slack_answer.lower(),
         }
         payload = block_kit_tool_result(
             fallback,
-            answer_blocks(fallback, sources),
+            answer_blocks(markdown_answer or fallback, sources),
             structured,
         )
         _log_verbose("ask_archive final Slack markdown", fallback)
@@ -485,8 +773,8 @@ class WavelengthService:
             # Remote MCP orchestration is intentionally non-streaming: the
             # complete structured response must be citation-validated before
             # Slack renders it or attaches Work Object metadata.
-            yield {"type": "tasks_init", "title": "Searching the archive", "steps": DEFAULT_SEARCH_STEPS}
-            yield {"type": "task", "id": "plan", "title": "Planning Search", "status": "in_progress"}
+            yield {"type": "plan", "title": "Searching the archive", "steps": DEFAULT_SEARCH_STEPS}
+            yield {"type": "task", "id": "planner", "title": "Planning Search", "status": "in_progress"}
             from openai import OpenAI
             client = OpenAI(api_key=self.engine.openai_config.api_key,
                             base_url=f"{os.environ['AZURE_OPENAI_ENDPOINT'].rstrip('/')}/openai/v1/")
@@ -501,7 +789,7 @@ class WavelengthService:
                 ),
                 stream=True,
             )
-            yield {"type": "task", "id": "plan", "title": "Planning Search", "status": "complete"}
+            yield {"type": "task", "id": "planner", "title": "Planning Search", "status": "complete"}
             search_details = []
             seen_searches = set()
             call_names = {}
@@ -640,16 +928,18 @@ class WavelengthService:
         }
 
         sources = cited_source_references(answer, all_sources)
-        slack_answer = markdown_to_slack_mrkdwn(replace_source_markers(answer, source_urls, link_urls=False))
+        markdown_answer = replace_source_markers(answer, source_urls, link_urls=False)
+        slack_answer = markdown_to_slack_mrkdwn(markdown_answer)
         fallback = slack_answer or "Wavelength could not generate an answer from the retrieved sources."
         structured = {
             "answer": slack_answer,
+            "answer_markdown": markdown_answer,
             "sources": sources,
             "needs_clarification": "what time period" in slack_answer.lower(),
         }
         payload = block_kit_tool_result(
             fallback,
-            answer_blocks(fallback, sources),
+            answer_blocks(markdown_answer or fallback, sources),
             structured,
         )
         _log_verbose("stream_archive final Slack markdown", fallback)
@@ -663,14 +953,26 @@ class WavelengthService:
         grouped: Dict[str, Dict[str, Any]] = {}
         for row in results:
             content_type = row.get("content_type", "article")
+            source_id_candidates = (
+                [
+                    row.get("parent_id"),
+                    row.get("source_id"),
+                    row.get("occurrence_id"),
+                    row.get("sourcepage"),
+                    row.get("url"),
+                ]
+                if content_type == "transcript"
+                else [
+                    row.get("source_id"),
+                    row.get("parent_id"),
+                    row.get("chunk_id"),
+                    row.get("occurrence_id"),
+                    row.get("sourcepage"),
+                    row.get("url"),
+                ]
+            )
             source_id = str(
-                row.get("source_id")
-                or row.get("parent_id")
-                or row.get("chunk_id")
-                or row.get("occurrence_id")
-                or row.get("sourcepage")
-                or row.get("url")
-                or ""
+                next((candidate for candidate in source_id_candidates if candidate), "")
             )
             if not source_id:
                 continue
@@ -752,22 +1054,29 @@ class WavelengthService:
                 self._source_cache[source_id] = dict(source)
 
     def _agent_source(self, source: Dict[str, Any]) -> Dict[str, Any]:
+        source_id = source.get("source_id") or source.get("id")
         passages = []
         for passage in source.get("passages") or []:
             if not isinstance(passage, dict):
                 continue
+            passage_id = passage.get("passage_id")
             passages.append({
-                "passage_id": passage.get("passage_id"),
-                "passage_ids": passage.get("passage_ids") or [passage.get("passage_id")],
+                "citation_key": _citation_key(source_id, passage_id),
+                "passage_id": passage_id,
+                "passage_ids": passage.get("passage_ids") or [passage_id],
                 "text": passage.get("text"),
                 "raw_vtt_excerpt": passage.get("raw_vtt_excerpt"),
                 "speakers": passage.get("speakers") or [],
                 "start_seconds": passage.get("start_seconds"),
                 "end_seconds": passage.get("end_seconds"),
+                "timestamp_url": passage.get("timestamp_url"),
             })
         return {
-            "source_id": source.get("source_id") or source.get("id"),
+            "source_id": source_id,
             "content_type": source.get("content_type"),
+            "title": source.get("title") or source.get("headline") or source.get("transcript_name"),
+            "url": source.get("url") or source.get("canonical_url") or source.get("transcript_url"),
+            "listen_url": source.get("listen_url") or source.get("transcript_url"),
             "published_at": source.get("published_at") or source.get("publish_date"),
             "authors": source.get("authors") or [],
             "speakers": source.get("speakers") or [],
@@ -846,12 +1155,14 @@ class WavelengthService:
             results = rng.sample(candidates, min(args["limit"], len(candidates)))
         else:
             results = candidates[:args["limit"]]
+        agent_sources = [self._agent_source(source) for source in results]
         payload = {
             "query": args["query"],
             "search_mode": search_mode,
             "search_top": search_top,
             "sampled": bool(sample),
-            "results": [self._agent_source(source) for source in results],
+            "results": agent_sources,
+            "citation_map": _citation_map_for_sources(agent_sources),
         }
         self._search_cache[cache_key] = payload
         return payload
@@ -887,7 +1198,11 @@ class WavelengthService:
         logical = self._logical_sources([source], 1)
         self._remember_sources(logical)
         source_payload = self._agent_source(logical[0]) if logical else {}
+        passage_id = f"content:{offset}:{next_offset}"
+        citation_key = _citation_key(source_payload.get("source_id") or source_id, passage_id)
         return {"source": source_payload, "content": segment,
+                "citation_key": citation_key,
+                "citation_map": [_segment_citation_entry(source_payload, citation_key, passage_id)],
                 "cursor": str(next_offset) if next_offset < len(content) else None,
                 "has_more": next_offset < len(content)}
 
@@ -917,7 +1232,22 @@ class WavelengthService:
         logical = self._logical_sources([source], 1)
         self._remember_sources(logical)
         source_payload = self._agent_source(logical[0]) if logical else {}
-        return {"source": source_payload, "cues": selected,
+        source_id_for_keys = source_payload.get("source_id") or source_id
+        keyed_cues = []
+        citation_map = []
+        for cue_index, cue in enumerate(selected, offset):
+            passage_id = f"cue:{cue_index}:{cue.get('start_seconds')}:{cue.get('end_seconds')}"
+            citation_key = _citation_key(source_id_for_keys, passage_id)
+            keyed_cues.append({**cue, "citation_key": citation_key})
+            citation_map.append({
+                **_segment_citation_entry(source_payload, citation_key, passage_id),
+                "listen_url": cue.get("timestamp_url") or source_payload.get("listen_url"),
+                "speakers": [cue.get("speaker")] if cue.get("speaker") else [],
+                "start_seconds": cue.get("start_seconds"),
+                "end_seconds": cue.get("end_seconds"),
+            })
+        return {"source": source_payload, "cues": keyed_cues,
+                "citation_map": citation_map,
                 "cursor": str(next_offset) if next_offset < len(cues) else None,
                 "has_more": next_offset < len(cues)}
 
@@ -941,7 +1271,11 @@ class WavelengthService:
         logical = self._logical_sources([source], 1)
         self._remember_sources(logical)
         source_payload = self._agent_source(logical[0]) if logical else {}
+        passage_id = f"content:{offset}:{next_offset}"
+        citation_key = _citation_key(source_payload.get("source_id") or source_id, passage_id)
         return {"source": source_payload, "content": segment,
+                "citation_key": citation_key,
+                "citation_map": [_segment_citation_entry(source_payload, citation_key, passage_id)],
                 "cursor": str(next_offset) if next_offset < len(content) else None,
                 "has_more": next_offset < len(content)}
 

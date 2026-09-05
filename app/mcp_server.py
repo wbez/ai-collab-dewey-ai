@@ -30,6 +30,15 @@ SLACK_THREAD_CONTEXT_MAX_CHARS = 30000
 SLACK_PERSISTED_THREAD_MAX_TURNS = 40
 SLACK_DM_WINDOW_CONTEXT_TS = "__dm_window__"
 SLACK_GET_METHODS = {"conversations.replies", "conversations.history", "users.list"}
+SLACK_WORK_OBJECT_ENTITIES_PER_MESSAGE = 50
+WAVELENGTH_ALPHA_NOTICE = (
+    "Wavelength is in early beta testing. "
+    "Hallucinations, errors, and unexpected outages are likely. Please report "
+    "all issues and commentary, good and bad, to <@U08G63C7H5Y>."
+)
+WAVELENGTH_ACCESS_DENIED_TEXT = (
+    "Wavelength is currently limited to approved alpha testers."
+)
 
 _SLACK_THREAD_HISTORY: Dict[tuple[str, str], List[Dict[str, str]]] = {}
 _MCP_SLACK_DM_CONTEXT: ContextVar[Optional[Dict[str, str]]] = ContextVar(
@@ -64,6 +73,10 @@ def _verbose_logging_enabled() -> bool:
 
 def _configure_console_logging_from_argv() -> None:
     script_name = os.path.basename(sys.argv[0]) if sys.argv else ""
+    if script_name == "mcp_server.py" and "--log-sources" in sys.argv[1:]:
+        os.environ["WAVELENGTH_LOG_SOURCES"] = "true"
+        logging.basicConfig(level=logging.INFO)
+        sys.argv[:] = [sys.argv[0], *(arg for arg in sys.argv[1:] if arg != "--log-sources")]
     if script_name == "mcp_server.py" and any(arg in {"-v", "--verbose"} for arg in sys.argv[1:]):
         os.environ["WAVELENGTH_VERBOSE_LOGS"] = "true"
         logging.basicConfig(level=logging.DEBUG)
@@ -130,13 +143,15 @@ def _cached_work_object_entity(external_id: Optional[str]) -> Optional[Dict[str,
 
 
 def _cache_work_object_sources(sources: List[Dict[str, Any]]) -> None:
+    from slack_format import work_object_external_id
+
     if not sources:
         return
     now = time.time()
     for source in sources:
         if not isinstance(source, dict):
             continue
-        external_id = str(source.get("source_id") or source.get("id") or "").strip()
+        external_id = work_object_external_id(source)
         if not external_id:
             continue
         _WORK_OBJECT_SOURCE_CACHE.pop(external_id, None)
@@ -167,6 +182,12 @@ def _cached_work_object_source(external_id: Optional[str]) -> Optional[Dict[str,
 
 
 def _work_object_source_id_from_event(event: Dict[str, Any]) -> Optional[str]:
+    for key in ("external_ref", "entity_id", "external_id"):
+        value = event.get(key)
+        if isinstance(value, dict) and value.get("id") is not None:
+            return str(value["id"])
+        if value is not None and not isinstance(value, dict):
+            return str(value)
     candidates = [event.get("external_ref"), event.get("entity"), event.get("link")]
     for candidate in candidates:
         if not isinstance(candidate, dict):
@@ -202,6 +223,22 @@ def _verify_slack_signature(headers: Dict[str, str], body: bytes, signing_secret
 
 def _split_env_list(value: Optional[str]) -> Set[str]:
     return {item.strip() for item in (value or "").split(",") if item.strip()}
+
+
+def _wavelength_allowed_slack_user_ids() -> Set[str]:
+    return _split_env_list(os.environ.get("WAVELENGTH_ALLOWED_SLACK_USER_IDS"))
+
+
+def _is_wavelength_allowed_slack_user(user_id: Optional[str]) -> bool:
+    allowed_user_ids = _wavelength_allowed_slack_user_ids()
+    return bool(user_id and user_id in allowed_user_ids)
+
+
+def _slack_payload_user_id(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        nested = value.get("id") or value.get("user")
+        return str(nested) if nested else None
+    return str(value) if value else None
 
 
 def _headers_from_scope(scope) -> Dict[str, str]:
@@ -269,6 +306,12 @@ def _tool_payload_text(payload: Dict[str, Any]) -> str:
     return text or "Wavelength finished processing the request."
 
 
+def _tool_payload_answer_markdown(payload: Dict[str, Any]) -> str:
+    structured = payload.get("structuredContent") if isinstance(payload.get("structuredContent"), dict) else {}
+    answer = structured.get("answer_markdown") if isinstance(structured, dict) else None
+    return str(answer) if answer else _tool_payload_text(payload)
+
+
 def _tool_payload_context_text(payload: Dict[str, Any]) -> str:
     text = _tool_payload_text(payload)
     sources = (payload.get("structuredContent") or {}).get("sources") or []
@@ -303,6 +346,56 @@ def _metadata_size(metadata: Dict[str, Any]) -> int:
     return len(json.dumps(metadata, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
+def _rich_text_mention_summaries(blocks: Any) -> List[Dict[str, Any]]:
+    summaries: List[Dict[str, Any]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            element_type = value.get("type")
+            if element_type in {"attachment_mention", "work_object_mention"}:
+                summaries.append({
+                    "type": element_type,
+                    "entity_id": value.get("entity_id"),
+                    "app_id": value.get("app_id"),
+                    "url": value.get("url"),
+                    "text": value.get("text"),
+                    "keys": sorted(value.keys()),
+                })
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(blocks)
+    return summaries
+
+
+def _work_object_entity_summaries(entities: Any) -> List[Dict[str, Any]]:
+    if not isinstance(entities, list):
+        return []
+    summaries: List[Dict[str, Any]] = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        external_ref = entity.get("external_ref") if isinstance(entity.get("external_ref"), dict) else {}
+        payload = entity.get("entity_payload") if isinstance(entity.get("entity_payload"), dict) else {}
+        attributes = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
+        summaries.append({
+            "entity_type": entity.get("entity_type"),
+            "external_ref": external_ref,
+            "url": entity.get("url"),
+            "app_unfurl_url": entity.get("app_unfurl_url"),
+            "title": (
+                attributes.get("title", {}).get("text")
+                if isinstance(attributes.get("title"), dict)
+                else None
+            ),
+            "keys": sorted(entity.keys()),
+        })
+    return summaries
+
+
 def _trim_work_object_entity(entity: Dict[str, Any]) -> Dict[str, Any]:
     payload = entity.get("entity_payload") if isinstance(entity.get("entity_payload"), dict) else {}
     attributes = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
@@ -315,26 +408,46 @@ def _trim_work_object_entity(entity: Dict[str, Any]) -> Dict[str, Any]:
     minimal_fields = [
         field
         for field in custom_fields
-        if isinstance(field, dict) and field.get("key") in {"date", "author"}
+        if isinstance(field, dict)
+        and field.get("key") in {
+            "description",
+            "source_url",
+            "date",
+            "time",
+            "author",
+            "speakers",
+            "excerpt",
+            "collectiveaccess",
+        }
+    ]
+    display_order = [
+        field.get("key")
+        for field in minimal_fields
+        if isinstance(field, dict) and field.get("key")
     ]
     return {
         **entity,
         "entity_payload": {
             "attributes": {
-                "title": {"text": title[:40]},
+                "title": {"text": title},
                 **({"display_type": display_type} if display_type else {}),
                 "display_id": str(attributes.get("display_id") or ""),
                 **({"product_icon": product_icon} if product_icon else {}),
             },
-            "fields": {},
             "custom_fields": minimal_fields,
+            "display_order": display_order,
         },
     }
 
 
-def _work_object_metadata_batches(entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _work_object_metadata_batches(
+    entities: List[Dict[str, Any]],
+    *,
+    max_entities_per_batch: int = SLACK_WORK_OBJECT_ENTITIES_PER_MESSAGE,
+) -> List[Dict[str, Any]]:
     batches: List[Dict[str, Any]] = []
     current: List[Dict[str, Any]] = []
+    max_entities_per_batch = max(1, max_entities_per_batch)
 
     for entity in entities:
         if not isinstance(entity, dict):
@@ -347,13 +460,15 @@ def _work_object_metadata_batches(entities: List[Dict[str, Any]]) -> List[Dict[s
                 **entity,
                 "entity_payload": {
                     "attributes": {"title": {"text": ""}},
-                    "fields": {},
                     "custom_fields": [],
                 },
             })
 
         candidate = {"entities": [*current, candidate_entity]}
-        if current and _metadata_size(candidate) > SLACK_WORK_OBJECT_METADATA_MAX_BYTES:
+        if current and (
+            len(current) >= max_entities_per_batch
+            or _metadata_size(candidate) > SLACK_WORK_OBJECT_METADATA_MAX_BYTES
+        ):
             batches.append({"entities": current})
             current = [candidate_entity]
         else:
@@ -374,7 +489,7 @@ def _tool_payload_work_object_metadata_batches(payload: Dict[str, Any]) -> List[
 
     sources = (payload.get("structuredContent") or {}).get("sources") or []
     entities = (
-        work_object_entities(sources, include_excerpt=False, include_collectiveaccess=False)
+        work_object_entities(sources, include_excerpt=True, include_collectiveaccess=False)
         if isinstance(sources, list)
         else []
     )
@@ -389,15 +504,19 @@ def _tool_payload_work_object_metadata_batches(payload: Dict[str, Any]) -> List[
     # event_payload), or Slack may silently drop the metadata and the unfurls.
     metadata = {"entities": entities}
     trimmed = False
-    capped = False
+    split = False
     try:
-        if _metadata_size(metadata) > SLACK_WORK_OBJECT_METADATA_MAX_BYTES:
-            metadata_batches = _work_object_metadata_batches([
-                _trim_work_object_entity(entity)
+        if (
+            len(entities) > SLACK_WORK_OBJECT_ENTITIES_PER_MESSAGE
+            or _metadata_size(metadata) > SLACK_WORK_OBJECT_METADATA_MAX_BYTES
+        ):
+            metadata_batches = _work_object_metadata_batches(entities)
+            split = len(metadata_batches) > 1
+            trimmed = any(
+                _metadata_size({"entities": [entity]}) > SLACK_WORK_OBJECT_METADATA_MAX_BYTES
                 for entity in entities
                 if isinstance(entity, dict)
-            ])
-            trimmed = True
+            )
         else:
             metadata_batches = [metadata]
         # Log a small, safe summary for diagnosing missing icons/unfurls.
@@ -415,12 +534,12 @@ def _tool_payload_work_object_metadata_batches(payload: Dict[str, Any]) -> List[
             product_icon = attrs.get("product_icon") if isinstance(attrs, dict) else None
             first_product_icon_url = product_icon.get("url") if isinstance(product_icon, dict) else None
         logger.info(
-            "Slack Work Object metadata prepared: entities=%d batches=%d bytes=%s trimmed=%s capped=%s product_icon_https=%s",
+            "Slack Work Object metadata prepared: entities=%d batches=%d bytes=%s split=%s trimmed=%s product_icon_https=%s",
             entity_count,
             len(metadata_batches),
             [_metadata_size(batch) for batch in metadata_batches],
+            split,
             trimmed,
-            capped,
             bool(first_product_icon_url and str(first_product_icon_url).startswith("https://")),
         )
         return metadata_batches
@@ -705,6 +824,9 @@ def _default_wavelength_home_view() -> Dict[str, Any]:
 
 
 def _publish_wavelength_home_tab(*, token: str, user_id: str, team_id: Optional[str] = None) -> None:
+    if not _is_wavelength_allowed_slack_user(user_id):
+        logger.info("Skipping Wavelength Home tab publish for non-allowed user %s.", user_id)
+        return
     _call_slack_api(
         token=token,
         method="views.publish",
@@ -716,9 +838,13 @@ def _publish_wavelength_home_tab(*, token: str, user_id: str, team_id: Optional[
 
 
 def _slack_home_user_ids(token: str) -> List[str]:
+    allowed_user_ids = _wavelength_allowed_slack_user_ids()
+    if not allowed_user_ids:
+        return []
+
     configured_user_ids = sorted(_split_env_list(os.environ.get("WAVELENGTH_HOME_USER_IDS")))
     if configured_user_ids:
-        return configured_user_ids
+        return [user_id for user_id in configured_user_ids if user_id in allowed_user_ids]
 
     user_ids: List[str] = []
     cursor = None
@@ -734,6 +860,7 @@ def _slack_home_user_ids(token: str) -> List[str]:
             user_id = str(member.get("id") or "")
             if (
                 user_id
+                and user_id in allowed_user_ids
                 and not member.get("deleted")
                 and not member.get("is_bot")
                 and user_id != "USLACKBOT"
@@ -1349,7 +1476,10 @@ def _post_slack_message(
     blocks: Optional[List[Dict[str, Any]]] = None,
     thread_ts: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
-) -> None:
+    unfurl_links: Optional[bool] = None,
+    unfurl_media: Optional[bool] = None,
+    fetch_after_post: bool = False,
+) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "channel": channel,
         "text": text,
@@ -1360,6 +1490,10 @@ def _post_slack_message(
         body["thread_ts"] = thread_ts
     if metadata:
         body["metadata"] = metadata
+    if unfurl_links is not None:
+        body["unfurl_links"] = unfurl_links
+    if unfurl_media is not None:
+        body["unfurl_media"] = unfurl_media
 
     # This is deliberately an INFO log, rather than a verbose payload dump: a
     # Work Object can fail to render while its accompanying Block Kit cards
@@ -1414,6 +1548,8 @@ def _post_slack_message(
         )
 
     message = response.get("message") if isinstance(response, dict) else {}
+    if isinstance(message, dict):
+        _log_verbose("Slack chat.postMessage returned message", message)
     returned_metadata = message.get("metadata") if isinstance(message, dict) else None
     returned_entities = (
         returned_metadata.get("entities")
@@ -1421,28 +1557,195 @@ def _post_slack_message(
         and isinstance(returned_metadata.get("entities"), list)
         else []
     )
+    returned_blocks = message.get("blocks") if isinstance(message, dict) else []
+    returned_mentions = _rich_text_mention_summaries(returned_blocks)
+    returned_entity_summaries = _work_object_entity_summaries(returned_entities)
     logger.info(
         "Slack message posted: channel=%s ts=%s work_object_entities_sent=%d "
-        "work_object_entities_returned=%d metadata_returned=%s",
+        "work_object_entities_returned=%d metadata_returned=%s "
+        "returned_work_object_entities=%s returned_mentions=%s",
         channel,
         message.get("ts") if isinstance(message, dict) else None,
         len(entities),
         len(returned_entities),
         isinstance(returned_metadata, dict),
+        returned_entity_summaries,
+        returned_mentions,
     )
+    if fetch_after_post and isinstance(message, dict) and message.get("ts"):
+        thread_root_ts = thread_ts or str(message["ts"])
+        try:
+            replies = _call_slack_api(
+                token=token,
+                method="conversations.replies",
+                payload={
+                    "channel": channel,
+                    "ts": thread_root_ts,
+                    "include_all_metadata":True,
+                    "limit": 15,
+                },
+            )
+            messages = replies.get("messages") if isinstance(replies, dict) else []
+            posted = None
+            if isinstance(messages, list):
+                for candidate in messages:
+                    if isinstance(candidate, dict) and candidate.get("ts") == message.get("ts"):
+                        posted = candidate
+                        break
+            if isinstance(posted, dict):
+                _log_verbose("Slack conversations.replies returned posted message", posted)
+                history_metadata = posted.get("metadata")
+                history_entities = (
+                    history_metadata.get("entities")
+                    if isinstance(history_metadata, dict)
+                    and isinstance(history_metadata.get("entities"), list)
+                    else []
+                )
+                logger.info(
+                    "Slack conversations.replies posted message: channel=%s ts=%s "
+                    "metadata_returned=%s work_object_entities_returned=%d "
+                    "returned_work_object_entities=%s returned_mentions=%s attachments=%s",
+                    channel,
+                    message.get("ts"),
+                    isinstance(history_metadata, dict),
+                    len(history_entities),
+                    _work_object_entity_summaries(history_entities),
+                    _rich_text_mention_summaries(posted.get("blocks")),
+                    posted.get("attachments"),
+                )
+            else:
+                logger.info(
+                    "Slack conversations.replies did not include posted message: channel=%s "
+                    "thread_ts=%s posted_ts=%s message_count=%d",
+                    channel,
+                    thread_root_ts,
+                    message.get("ts"),
+                    len(messages) if isinstance(messages, list) else 0,
+                )
+        except Exception:
+            logger.exception(
+                "Could not fetch Slack posted message after post: channel=%s ts=%s",
+                channel,
+                message.get("ts"),
+            )
+    return message if isinstance(message, dict) else {}
+
+
+def _update_slack_message(
+    *,
+    token: str,
+    channel: str,
+    ts: str,
+    text: str,
+    blocks: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "channel": channel,
+        "ts": ts,
+        "text": text,
+    }
+    if blocks:
+        body["blocks"] = blocks
+    logger.info(
+        "Updating Slack message: channel=%s ts=%s blocks=%d",
+        channel,
+        ts,
+        len(blocks or []),
+    )
+    response = _call_slack_api(token=token, method="chat.update", payload=body)
+    message = response.get("message") if isinstance(response, dict) else {}
+    if isinstance(message, dict):
+        _log_verbose("Slack chat.update returned message", message)
+    return message if isinstance(message, dict) else {}
+
+
+def _posted_message_from_replies(
+    *,
+    token: str,
+    channel: str,
+    thread_ts: str,
+    posted_ts: str,
+) -> Optional[Dict[str, Any]]:
+    replies = _call_slack_api(
+        token=token,
+        method="conversations.replies",
+        payload={
+            "channel": channel,
+            "ts": thread_ts,
+            "include_all_metadata": True,
+            "limit": 100,
+        },
+    )
+    messages = replies.get("messages") if isinstance(replies, dict) else []
+    if not isinstance(messages, list):
+        return None
+    for candidate in messages:
+        if isinstance(candidate, dict) and str(candidate.get("ts") or "") == str(posted_ts):
+            return candidate
+    return None
+
+
+def _message_has_attachment(message: Optional[Dict[str, Any]]) -> bool:
+    attachments = message.get("attachments") if isinstance(message, dict) else None
+    return isinstance(attachments, list) and bool(attachments)
+
+
+def _wait_for_posted_message_attachment(
+    *,
+    token: str,
+    channel: str,
+    thread_ts: Optional[str],
+    posted_ts: str,
+    attempts: int = 4,
+    delay_seconds: float = 0.35,
+) -> Optional[Dict[str, Any]]:
+    if not posted_ts:
+        return None
+    root_ts = thread_ts or posted_ts
+    last_message: Optional[Dict[str, Any]] = None
+    for attempt in range(max(1, attempts)):
+        try:
+            last_message = _posted_message_from_replies(
+                token=token,
+                channel=channel,
+                thread_ts=root_ts,
+                posted_ts=posted_ts,
+            )
+        except Exception:
+            logger.exception(
+                "Could not fetch Slack message while waiting for attachment: channel=%s thread_ts=%s posted_ts=%s",
+                channel,
+                root_ts,
+                posted_ts,
+            )
+            return None
+        if _message_has_attachment(last_message):
+            return last_message
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds)
+    logger.warning(
+        "Slack message attachment was not visible before inline mention update: channel=%s thread_ts=%s posted_ts=%s attempts=%d",
+        channel,
+        root_ts,
+        posted_ts,
+        attempts,
+    )
+    return last_message
 
 
 def _work_object_registration_blocks(
     entities: List[Dict[str, Any]],
     *,
     work_object_app_id: Optional[str],
+    include_header: bool = True,
 ) -> Optional[List[Dict[str, Any]]]:
     from slack_format import slack_link_url
 
     if not entities or not work_object_app_id:
         return None
-    elements: List[Dict[str, Any]] = [{"type": "text", "text": "Source unfurls: "}]
-    first = True
+    elements: List[Dict[str, Any]] = []
+    if include_header:
+        elements.append({"type": "text", "text": "Sources:", "style": {"bold": True}})
     for entity in entities:
         if not isinstance(entity, dict):
             continue
@@ -1452,27 +1755,149 @@ def _work_object_registration_blocks(
         payload = entity.get("entity_payload") if isinstance(entity.get("entity_payload"), dict) else {}
         attributes = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
         display_id = str(attributes.get("display_id") or entity_id).strip()
+        title = ""
+        if isinstance(attributes.get("title"), dict):
+            title = str(attributes["title"].get("text") or "").strip()
+        title = title or display_id or "Archive source"
         product_icon = attributes.get("product_icon") if isinstance(attributes.get("product_icon"), dict) else {}
         icon_url = product_icon.get("url") if isinstance(product_icon, dict) else None
         if not entity_id or not url:
             continue
-        if not first:
-            elements.append({"type": "text", "text": " "})
-        first = False
+        label = f"[{display_id}] " if display_id.isdigit() else ""
+        if elements:
+            elements.append({"type": "text", "text": "\n"})
+        if label:
+            elements.append({"type": "text", "text": label})
         elements.append({
-            "type": "work_object_mention",
+            "type": "attachment_mention",
             "entity_id": entity_id,
             "app_id": str(work_object_app_id),
-            "text": f"[{display_id}]" if display_id.isdigit() else display_id,
+            "text": title,
             "url": slack_link_url(url),
             **({"icon_url": slack_link_url(str(icon_url))} if icon_url else {}),
         })
-    if len(elements) <= 1:
+    if not any(isinstance(element, dict) and element.get("type") == "attachment_mention" for element in elements):
         return None
     return [{
         "type": "rich_text",
-        "elements": [{"type": "rich_text_section", "elements": elements}],
+        "elements": [
+            {
+                "type": "rich_text_section",
+                "elements": elements,
+            }
+        ],
     }]
+
+
+def _payload_sources(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    sources = (payload.get("structuredContent") or {}).get("sources") or []
+    return [source for source in sources if isinstance(source, dict)] if isinstance(sources, list) else []
+
+
+def _citation_numbers(text: str) -> List[int]:
+    numbers: List[int] = []
+    seen: Set[int] = set()
+    for match in re.finditer(r"\[(\d+)(?:[a-z])?\]", text or ""):
+        number = int(match.group(1))
+        if number in seen:
+            continue
+        seen.add(number)
+        numbers.append(number)
+    return numbers
+
+
+def _answer_message_units(answer: str) -> List[str]:
+    units: List[str] = []
+    current: List[str] = []
+
+    def flush_current() -> None:
+        nonlocal current
+        if current:
+            units.append("\n".join(current).strip())
+            current = []
+
+    for line in (answer or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line.strip():
+            flush_current()
+            continue
+        if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line):
+            flush_current()
+            units.append(line.strip())
+            continue
+        current.append(line)
+
+    flush_current()
+    return units or ([answer.strip()] if (answer or "").strip() else [])
+
+
+def _answer_source_segments(
+    answer: str,
+    sources: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    from slack_format import work_object_external_id
+
+    sources_by_number = {
+        int(source.get("number")): source
+        for source in sources
+        if str(source.get("number") or "").isdigit()
+    }
+    attached_entity_ids: Set[str] = set()
+    pending_units: List[str] = []
+    segments: List[Dict[str, Any]] = []
+
+    def flush(new_sources: List[Dict[str, Any]]) -> None:
+        nonlocal pending_units
+        text = "\n".join(unit for unit in pending_units if unit).strip()
+        if text:
+            segments.append({"text": text, "new_sources": new_sources})
+        pending_units = []
+
+    for unit in _answer_message_units(answer):
+        pending_units.append(unit)
+        new_sources: List[Dict[str, Any]] = []
+        for number in _citation_numbers(unit):
+            source = sources_by_number.get(number)
+            if not source:
+                continue
+            entity_id = work_object_external_id(source)
+            if not entity_id or entity_id in attached_entity_ids:
+                continue
+            attached_entity_ids.add(entity_id)
+            new_sources.append(source)
+        if new_sources:
+            flush(new_sources)
+
+    if pending_units:
+        flush([])
+
+    return segments
+
+
+def _work_object_metadata_batches_for_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    from slack_format import work_object_entities
+
+    entities = work_object_entities(sources, include_excerpt=True, include_collectiveaccess=False)
+    if sources:
+        _cache_work_object_sources(sources)
+    return _work_object_metadata_batches(entities) if entities else []
+
+
+def _record_attachment_locations(
+    attachment_locations: Dict[str, Dict[str, str]],
+    *,
+    entities: List[Dict[str, Any]],
+    channel: str,
+    message_ts: Optional[str],
+) -> None:
+    if not message_ts:
+        return
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        external_ref = entity.get("external_ref") if isinstance(entity.get("external_ref"), dict) else {}
+        entity_id = str(external_ref.get("id") or "").strip()
+        if entity_id:
+            attachment_locations.setdefault(entity_id, {"channel_id": channel, "ts": str(message_ts)})
 
 
 def _post_slack_message_with_work_objects(
@@ -1485,29 +1910,109 @@ def _post_slack_message_with_work_objects(
     payload: Optional[Dict[str, Any]] = None,
     team_id: Optional[str] = None,
 ) -> None:
-    batches = _tool_payload_work_object_metadata_batches(payload or {})
-    first_metadata = batches[0] if batches else None
-    _post_slack_message(
-        token=token,
-        channel=channel,
-        text=text,
-        blocks=blocks,
-        thread_ts=thread_ts,
-        metadata=first_metadata,
-    )
     app_id = _team_api_app_id(team_id)
-    for batch in batches[1:]:
+    payload = payload or {}
+    sources = _payload_sources(payload)
+    if not sources or not app_id:
         _post_slack_message(
             token=token,
             channel=channel,
-            text="Wavelength source unfurls.",
-            blocks=_work_object_registration_blocks(
-                batch.get("entities") or [],
-                work_object_app_id=app_id,
-            ),
+            text=text,
+            blocks=blocks,
             thread_ts=thread_ts,
-            metadata=batch,
         )
+        return
+
+    from slack_format import answer_blocks, markdown_to_slack_mrkdwn
+
+    answer_markdown = _tool_payload_answer_markdown(payload)
+    attachment_locations: Dict[str, Dict[str, str]] = {}
+    segments = _answer_source_segments(answer_markdown, sources)
+    if not segments:
+        segments = [{"text": answer_markdown or text, "new_sources": []}]
+
+    for segment in segments:
+        segment_text = str(segment.get("text") or "")
+        new_sources = segment.get("new_sources") if isinstance(segment.get("new_sources"), list) else []
+        batches = _work_object_metadata_batches_for_sources(new_sources)
+        first_batch = batches[0] if batches else None
+        segment_blocks = answer_blocks(
+            segment_text,
+            sources,
+            work_object_app_id=None if batches else app_id,
+            attachment_locations=None if batches else attachment_locations,
+        )
+        posted = _post_slack_message(
+            token=token,
+            channel=channel,
+            text=markdown_to_slack_mrkdwn(segment_text) or text,
+            blocks=segment_blocks,
+            thread_ts=thread_ts,
+            metadata=first_batch,
+        )
+        posted_ts = str(posted.get("ts") or "")
+        refreshed = None
+        if first_batch:
+            refreshed = _wait_for_posted_message_attachment(
+                token=token,
+                channel=channel,
+                thread_ts=thread_ts,
+                posted_ts=posted_ts,
+            )
+            if _message_has_attachment(refreshed):
+                _record_attachment_locations(
+                    attachment_locations,
+                    entities=(first_batch or {}).get("entities") or [],
+                    channel=channel,
+                    message_ts=str(refreshed.get("ts") or posted_ts),
+                )
+
+        for batch in batches[1:]:
+            continuation = _post_slack_message(
+                token=token,
+                channel=channel,
+                text="Additional source attachments.",
+                blocks=_work_object_registration_blocks(
+                    batch.get("entities") or [],
+                    work_object_app_id=app_id,
+                    include_header=False,
+                ),
+                thread_ts=thread_ts,
+                metadata=batch,
+            )
+            continuation_ts = str(continuation.get("ts") or "")
+            refreshed_continuation = _wait_for_posted_message_attachment(
+                token=token,
+                channel=channel,
+                thread_ts=thread_ts,
+                posted_ts=continuation_ts,
+            )
+            if _message_has_attachment(refreshed_continuation):
+                _record_attachment_locations(
+                    attachment_locations,
+                    entities=batch.get("entities") or [],
+                    channel=channel,
+                    message_ts=str(refreshed_continuation.get("ts") or continuation_ts),
+                )
+
+        if posted_ts and any(
+            (entity.get("external_ref") or {}).get("id") in attachment_locations
+            for batch in batches
+            for entity in (batch.get("entities") or [])
+            if isinstance(entity, dict) and isinstance(entity.get("external_ref"), dict)
+        ):
+            _update_slack_message(
+                token=token,
+                channel=channel,
+                ts=posted_ts,
+                text=markdown_to_slack_mrkdwn(segment_text) or text,
+                blocks=answer_blocks(
+                    segment_text,
+                    sources,
+                    work_object_app_id=app_id,
+                    attachment_locations=attachment_locations,
+                ),
+            )
 
 
 def _logo_test_payload(work_object_app_id: Optional[str]) -> Dict[str, Any]:
@@ -1518,8 +2023,8 @@ def _logo_test_payload(work_object_app_id: Optional[str]) -> Dict[str, Any]:
     cst_entity_id = f"logo_test_cst_s3_{nonce}"
     wbez_icon = WBEZ_WORK_OBJECT_ICON_URL
     cst_icon = CST_WORK_OBJECT_ICON_URL
-    wbez_url = "https://www.wbez.org/"
-    cst_url = "https://chicago.suntimes.com/"
+    wbez_url = f"https://www.wbez.org/?k={nonce}a"
+    cst_url = f"https://chicago.suntimes.com/?k={nonce}b"
     text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit [1]. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua [2]."
 
     if work_object_app_id:
@@ -1559,7 +2064,7 @@ def _logo_test_payload(work_object_app_id: Optional[str]) -> Dict[str, Any]:
 
     def entity(entity_id: str, title: str, url: str, icon_url: Optional[str], alt_text: str) -> Dict[str, Any]:
         return {
-            "entity_type": "slack#/entities/content_item",
+            "entity_type": "slack#/entities/item",
             "external_ref": {"id": entity_id},
             "url": url,
             "entity_payload": {
@@ -1568,7 +2073,6 @@ def _logo_test_payload(work_object_app_id: Optional[str]) -> Dict[str, Any]:
                     "display_id": entity_id,
                     **({"product_icon": {"url": icon_url, "alt_text": alt_text}} if icon_url else {}),
                 },
-                "fields": {},
                 "custom_fields": [],
             },
         }
@@ -1586,6 +2090,66 @@ def _logo_test_payload(work_object_app_id: Optional[str]) -> Dict[str, Any]:
             "wbez": {"source": "s3", "url": wbez_icon, "entity_id": wbez_entity_id},
             "cst": {"source": "s3", "url": cst_icon, "entity_id": cst_entity_id},
         },
+    }
+
+
+LOGO_TEST_PROBE_ID = "citation-probe-8df1ebd3"
+LOGO_TEST_PROBE_URL = "https://www.wbez.org/?k=8df1ebd3a"
+
+
+def _logo_test_registration_probe_payload() -> Dict[str, Any]:
+    return {
+        "text": "Work Object registration probe",
+        "metadata": {
+            "entities": [
+                {
+                    "entity_type": "slack#/entities/item",
+                    "external_ref": {
+                        "id": LOGO_TEST_PROBE_ID,
+                        "type": "citation",
+                    },
+                    "url": LOGO_TEST_PROBE_URL,
+                    "entity_payload": {
+                        "attributes": {
+                            "title": {"text": "WBEZ citation probe"},
+                            "display_id": LOGO_TEST_PROBE_ID,
+                        },
+                        "custom_fields": [],
+                    },
+                }
+            ],
+        },
+    }
+
+
+def _logo_test_work_object_mention_probe_payload(work_object_app_id: Optional[str], ref: Optional[str] = None) -> Dict[str, Any]:
+    from slack_format import slack_link_url
+
+    text = "Work Object mention probe [1]"
+    if not work_object_app_id:
+        return {"text": text, "blocks": None}
+    return {
+        "text": text,
+        "blocks": [
+            {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {"type": "text", "text": "Work Object mention probe "},
+                            {
+                                "type": "work_object_mention",
+                                "entity_id": ref or LOGO_TEST_PROBE_ID,
+                                "app_id": str(work_object_app_id),
+                                "text": "[1]",
+                                "url": slack_link_url(LOGO_TEST_PROBE_URL),
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
     }
 
 
@@ -1713,7 +2277,7 @@ def _stream_answer_to_slack(
                 from slack_format import answer_blocks
 
                 blocks = answer_blocks(
-                    final_text,
+                    _tool_payload_answer_markdown(final_payload or {}),
                     sources,
                     work_object_app_id=_team_api_app_id(team_id),
                 )
@@ -1770,6 +2334,7 @@ def _handle_event_question(
     conversation_context: Optional[List[Dict[str, str]]] = None,
     persist_thread_ts: Optional[str] = None,
     use_dm_window_context: bool = False,
+    include_alpha_notice: bool = False,
 ) -> None:
     try:
         logger.info(
@@ -1780,6 +2345,13 @@ def _handle_event_question(
             user_id,
             team_id,
         )
+        if include_alpha_notice:
+            _post_slack_message(
+                token=bot_token,
+                channel=channel,
+                text=WAVELENGTH_ALPHA_NOTICE,
+                thread_ts=thread_ts,
+            )
         if conversation_context is None:
             if use_dm_window_context:
                 if os.environ.get("WAVELENGTH_RESPONSES_MCP_ENABLED") == "true":
@@ -1815,7 +2387,7 @@ def _handle_event_question(
                     from slack_format import answer_blocks
 
                     blocks = answer_blocks(
-                        _tool_payload_text(payload),
+                        _tool_payload_answer_markdown(payload),
                         sources,
                         work_object_app_id=_team_api_app_id(team_id),
                     )
@@ -1900,7 +2472,7 @@ def _handle_slash_question(
                 from slack_format import answer_blocks
 
                 blocks = answer_blocks(
-                    _tool_payload_text(payload),
+                    _tool_payload_answer_markdown(payload),
                     sources,
                     work_object_app_id=_team_api_app_id(team_id),
                 )
@@ -2068,7 +2640,8 @@ def create_mcp_server(service: Optional[Any] = None):
             "archive question. Use a complete semantic query, and put dates, people, "
             "program, content scope, and ordering in their dedicated parameters. Never "
             "use web-search syntax or domains in query text. content_types is limited to "
-            "the literal values article, transcript, and script."
+            "the literal values article, transcript, and script. Returned passages include "
+            "short citation_key handles for inline answer citations."
         ),
         annotations=readonly,
     )
@@ -2096,7 +2669,8 @@ def create_mcp_server(service: Optional[Any] = None):
         description=(
             "Search the archive with lexical keyword matching. Use when exact words, "
             "titles, names, or phrases matter, or when semantic search misses likely "
-            "literal matches. Put filters in dedicated parameters."
+            "literal matches. Put filters in dedicated parameters. Returned passages "
+            "include short citation_key handles for inline answer citations."
         ),
         annotations=readonly,
     )
@@ -2125,7 +2699,8 @@ def create_mcp_server(service: Optional[Any] = None):
         description=(
             "Retrieve a broader candidate set and return a random sample. Use for "
             "breadth, representative examples, or to avoid overfitting to the first "
-            "relevance-ranked results."
+            "relevance-ranked results. Returned passages include short citation_key "
+            "handles for inline answer citations."
         ),
         annotations=readonly,
     )
@@ -2151,7 +2726,7 @@ def create_mcp_server(service: Optional[Any] = None):
     @mcp.tool(
         name="get_full_article",
         title="Read a full Wavelength article",
-        description="Retrieve the full text of an article returned by search_archive. Use when search passages are insufficient evidence; follow cursor when has_more is true.",
+        description="Retrieve the full text of an article returned by search_archive. Use when search passages are insufficient evidence; follow cursor when has_more is true. The response includes a short citation_key for the returned text segment.",
         annotations=readonly,
     )
     def get_full_article(
@@ -2162,7 +2737,7 @@ def create_mcp_server(service: Optional[Any] = None):
         return service.get_full_article_data(source_id, cursor, max_chars)
 
     @mcp.tool(name="get_full_transcript", title="Get full transcript",
-              description="Retrieve ordered cues from a transcript returned by search_archive. Use time bounds for a requested moment and follow cursor when has_more is true.", annotations=readonly)
+              description="Retrieve ordered cues from a transcript returned by search_archive. Use time bounds for a requested moment and follow cursor when has_more is true. Returned cues include short citation_key handles for inline answer citations.", annotations=readonly)
     def get_full_transcript(
         source_id: Annotated[str, Field(description="source_id of a transcript returned by search_archive")],
         cursor: Annotated[Optional[str], Field(description="Cursor returned by an earlier call, if more cues are needed")] = None,
@@ -2173,7 +2748,7 @@ def create_mcp_server(service: Optional[Any] = None):
         return service.get_full_transcript_data(source_id, cursor, max_chars, start_seconds, end_seconds)
 
     @mcp.tool(name="get_full_script", title="Get full script",
-              description="Retrieve the full text of an occurrence script returned by search_archive.", annotations=readonly)
+              description="Retrieve the full text of an occurrence script returned by search_archive. The response includes a short citation_key for the returned text segment.", annotations=readonly)
     def get_full_script(
         source_id: Annotated[str, Field(description="source_id of a script returned by search_archive")],
         cursor: Annotated[Optional[str], Field(description="Cursor returned by an earlier call, if more text is needed")] = None,
@@ -2358,15 +2933,18 @@ def _add_slack_routes(app, service) -> None:
             bot_token = os.environ.get("SLACK_BOT_TOKEN")
             if not bot_token:
                 return PlainTextResponse("SLACK_BOT_TOKEN is not configured.", status_code=500)
-            user_id = event.get("user")
+            user_id = _slack_payload_user_id(event.get("user"))
             if not user_id:
+                return JSONResponse({"ok": True})
+            if not _is_wavelength_allowed_slack_user(user_id):
+                logger.info("Ignoring Wavelength Home open for non-allowed user %s.", user_id)
                 return JSONResponse({"ok": True})
             return JSONResponse(
                 {"ok": True},
                 background=BackgroundTask(
                     _publish_wavelength_home_tab,
                     token=bot_token,
-                    user_id=str(user_id),
+                    user_id=user_id,
                     team_id=str(event.get("team_id") or payload.get("team_id") or "unknown"),
                 ),
             )
@@ -2374,6 +2952,13 @@ def _add_slack_routes(app, service) -> None:
         # Work Object flexpane requests can include bot context; do not short
         # circuit these based on `bot_id` or `subtype`.
         if event_type == "entity_details_requested":
+            user_id = _slack_payload_user_id(event.get("user"))
+            if not _is_wavelength_allowed_slack_user(user_id):
+                logger.info(
+                    "Ignoring Work Object details request for non-allowed user %s.",
+                    user_id,
+                )
+                return JSONResponse({"ok": True})
             # Present details quickly: trigger_id expires fast. Prefer cached
             # entity metadata from the message we posted, and fall back to a
             # minimal view derived from the event payload.
@@ -2417,19 +3002,51 @@ def _add_slack_routes(app, service) -> None:
                     int((time.time() - request_started_at) * 1000),
                 )
 
+                entity_url = event.get("entity_url") or (event.get("link") or {}).get("url")
+                source_detail = _cached_work_object_source(str(source_id) if source_id else None)
+                if not source_detail:
+                    raw_source = None
+                    if source_id:
+                        try:
+                            raw_source = service.engine.get_source(str(source_id))
+                        except Exception:
+                            logger.exception(
+                                "Could not fetch Work Object source by id: source_id=%s",
+                                source_id,
+                            )
+                    if not raw_source and entity_url:
+                        try:
+                            raw_source = service.engine.get_source_by_url(str(entity_url))
+                        except Exception:
+                            logger.exception(
+                                "Could not fetch Work Object source by URL: source_id=%s entity_url=%s",
+                                source_id,
+                                entity_url,
+                            )
+                    if raw_source:
+                        from slack_format import source_reference
+
+                        source_detail = source_reference(raw_source, 1)
+                        _cache_work_object_sources([source_detail])
+                        logger.info(
+                            "Reconstituted Work Object source detail: source_id=%s "
+                            "entity_url_present=%s content_type=%s title=%s",
+                            source_id,
+                            bool(entity_url),
+                            source_detail.get("content_type"),
+                            source_detail.get("title"),
+                        )
+
                 if not work_object:
-                    entity_url = event.get("entity_url") or (event.get("link") or {}).get("url")
                     work_object = {
-                        "entity_type": "slack#/entities/content_item",
+                        "entity_type": "slack#/entities/item",
                         "url": entity_url,
-                        "app_unfurl_url": entity_url,
                         "external_ref": {"id": str(source_id)} if source_id is not None else {},
                         "entity_payload": {
                             "attributes": {
                                 "title": {"text": f"Archive source {source_id}"},
                                 "display_id": str(source_id),
                             },
-                            "fields": {},
                             "custom_fields": [
                                 *([
                                     {
@@ -2442,31 +3059,46 @@ def _add_slack_routes(app, service) -> None:
                             ],
                         },
                     }
-                source_detail = _cached_work_object_source(str(source_id) if source_id else None)
+                if source_detail:
+                    from slack_format import work_object_entities
+
+                    detail_objects = work_object_entities(
+                        [source_detail],
+                        include_full_text=True,
+                        include_excerpt=True,
+                        include_collectiveaccess=True,
+                    )
+                    if detail_objects:
+                        work_object = detail_objects[0]
+
                 if source_detail and source_detail.get("full_text"):
                     entity_payload = (
                         work_object.get("entity_payload")
                         if isinstance(work_object.get("entity_payload"), dict)
                         else {}
                     )
-                    fields = (
-                        dict(entity_payload.get("fields") or {})
-                        if isinstance(entity_payload.get("fields"), dict)
-                        else {}
-                    )
+                    custom_fields = list(entity_payload.get("custom_fields") or [])
+                    custom_fields = [
+                        field
+                        for field in custom_fields
+                        if not (isinstance(field, dict) and field.get("key") == "description")
+                    ]
                     from slack_format import work_object_description_text
 
-                    fields["description"] = {
+                    custom_fields.insert(0, {
+                        "key": "description",
+                        "label": "Description",
                         "value": work_object_description_text(source_detail.get("full_text")),
-                        "format": "markdown",
-                    }
+                        "type": "string",
+                        "format": "markdown"
+                    })
                     display_order = list(entity_payload.get("display_order") or [])
                     display_order = [key for key in display_order if key != "description"]
                     work_object = {
                         **work_object,
                         "entity_payload": {
                             **entity_payload,
-                            "fields": fields,
+                            "custom_fields": custom_fields,
                             "display_order": ["description", *display_order],
                         },
                     }
@@ -2561,6 +3193,22 @@ def _add_slack_routes(app, service) -> None:
         if event_type == "message" and event.get("channel_type") != "im":
             return JSONResponse({"ok": True})
 
+        user_id = _slack_payload_user_id(event.get("user"))
+        if not user_id:
+            logger.info(
+                "Ignoring Wavelength Slack event without a user id: event_type=%s text=%r.",
+                event_type,
+                str(event.get("text") or "")[:500],
+            )
+            return JSONResponse({"ok": True})
+        if not _is_wavelength_allowed_slack_user(user_id):
+            logger.info(
+                "Ignoring Wavelength Slack event for non-allowed user %s: event_type=%s.",
+                user_id,
+                event_type,
+            )
+            return JSONResponse({"ok": True})
+
         bot_token = os.environ.get("SLACK_BOT_TOKEN")
         if not bot_token:
             return PlainTextResponse("SLACK_BOT_TOKEN is not configured.", status_code=500)
@@ -2581,6 +3229,83 @@ def _add_slack_routes(app, service) -> None:
 
         event_ts = _slack_event_ts(event)
         incoming_thread_ts = _slack_event_thread_ts(payload)
+        if question == "logo test 1":
+            logo_payload = _logo_test_registration_probe_payload()
+            logger.info(
+                "Posting logo test 1 registration probe: team_id=%s api_app_id=%s "
+                "thread_ts=%s probe_id=%s metadata_entities=%d",
+                payload.get("team_id"),
+                payload.get("api_app_id"),
+                incoming_thread_ts,
+                LOGO_TEST_PROBE_ID,
+                len((logo_payload.get("metadata") or {}).get("entities") or []),
+            )
+            return JSONResponse(
+                {"ok": True},
+                background=BackgroundTask(
+                    _post_slack_message,
+                    token=bot_token,
+                    channel=channel,
+                    text=logo_payload["text"],
+                    thread_ts=incoming_thread_ts,
+                    metadata=logo_payload["metadata"],
+                    unfurl_links=False,
+                    unfurl_media=False,
+                    fetch_after_post=True,
+                ),
+            )
+        if question == "logo test 2":
+            work_object_app_id = payload.get("api_app_id") or _team_api_app_id(payload.get("team_id"))
+            logo_payload = _logo_test_work_object_mention_probe_payload(work_object_app_id)
+            logger.info(
+                "Posting logo test 2 Work Object mention probe: team_id=%s api_app_id=%s "
+                "work_object_app_id=%s thread_ts=%s probe_id=%s blocks=%d",
+                payload.get("team_id"),
+                payload.get("api_app_id"),
+                work_object_app_id,
+                incoming_thread_ts,
+                LOGO_TEST_PROBE_ID,
+                len(logo_payload.get("blocks") or []),
+            )
+            return JSONResponse(
+                {"ok": True},
+                background=BackgroundTask(
+                    _post_slack_message,
+                    token=bot_token,
+                    channel=channel,
+                    text=logo_payload["text"],
+                    blocks=logo_payload.get("blocks"),
+                    thread_ts=incoming_thread_ts,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                ),
+            )
+        if question == "logo test 3":
+            work_object_app_id = payload.get("api_app_id") or _team_api_app_id(payload.get("team_id"))
+            logo_payload = _logo_test_work_object_mention_probe_payload(work_object_app_id, ref='Ev0BULNW89S6')
+            logger.info(
+                "Posting logo test 2 Work Object mention probe: team_id=%s api_app_id=%s "
+                "work_object_app_id=%s thread_ts=%s probe_id=%s blocks=%d",
+                payload.get("team_id"),
+                payload.get("api_app_id"),
+                work_object_app_id,
+                incoming_thread_ts,
+                LOGO_TEST_PROBE_ID,
+                len(logo_payload.get("blocks") or []),
+            )
+            return JSONResponse(
+                {"ok": True},
+                background=BackgroundTask(
+                    _post_slack_message,
+                    token=bot_token,
+                    channel=channel,
+                    text=logo_payload["text"],
+                    blocks=logo_payload.get("blocks"),
+                    thread_ts=incoming_thread_ts,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                ),
+            )
         if question == "logo test":
             logo_payload = _logo_test_payload(payload.get("api_app_id") or _team_api_app_id(payload.get("team_id")))
             logger.info(
@@ -2608,6 +3333,7 @@ def _add_slack_routes(app, service) -> None:
         assistant_thread = event.get("assistant_thread") if isinstance(event.get("assistant_thread"), dict) else {}
         explicit_thread_ts = event.get("thread_ts") or assistant_thread.get("thread_ts")
         is_top_level_dm = event_type == "message" and event.get("channel_type") == "im" and not explicit_thread_ts
+        is_new_mention_thread = event_type == "app_mention" and not explicit_thread_ts
         # Thinking Steps streams require a concrete parent message. In a DM,
         # use the incoming message as that parent and keep the exchange in its
         # reply thread.
@@ -2630,12 +3356,13 @@ def _add_slack_routes(app, service) -> None:
                 bot_token=bot_token,
                 question=question,
                 channel=channel,
-                user_id=event.get("user"),
+                user_id=user_id,
                 team_id=event.get("team") or payload.get("team_id"),
                 thread_ts=response_thread_ts,
                 event_ts=event_ts,
                 persist_thread_ts=persist_thread_ts,
                 use_dm_window_context=is_top_level_dm,
+                include_alpha_notice=is_top_level_dm or is_new_mention_thread,
             ),
         )
 
@@ -2653,12 +3380,22 @@ def _add_slack_routes(app, service) -> None:
             "Slack slash command inbound form",
             {key: ("REDACTED" if key == "response_url" else value) for key, value in form.items()},
         )
+        user_id = form.get("user_id")
+        if not _is_wavelength_allowed_slack_user(user_id):
+            logger.info("Rejecting Wavelength slash command for non-allowed user %s.", user_id)
+            return JSONResponse(
+                {
+                    "response_type": "ephemeral",
+                    "text": WAVELENGTH_ACCESS_DENIED_TEXT,
+                }
+            )
+
         question = (form.get("text") or "").strip()
         if not question:
             return JSONResponse(
                 {
                     "response_type": "ephemeral",
-                    "text": "Ask a question after `/wavelength`, for example: `/wavelength Find coverage of CTA funding in 2024`.",
+                    "text": WAVELENGTH_ALPHA_NOTICE,
                 }
             )
 
@@ -2675,7 +3412,7 @@ def _add_slack_routes(app, service) -> None:
         return JSONResponse(
             {
                 "response_type": "ephemeral",
-                "text": "Wavelength is searching the archive.",
+                "text": WAVELENGTH_ALPHA_NOTICE,
             },
             background=BackgroundTask(
                 _handle_slash_question,
@@ -2684,7 +3421,7 @@ def _add_slack_routes(app, service) -> None:
                 response_url=response_url,
                 bot_token=bot_token,
                 channel=form.get("channel_id"),
-                user_id=form.get("user_id"),
+                user_id=user_id,
                 team_id=form.get("team_id"),
                 response_type=response_type,
             ),
@@ -2700,6 +3437,10 @@ def _add_slack_routes(app, service) -> None:
         team = payload.get("team") or {}
         _cache_team_api_app_id(team.get("id") or payload.get("team_id"), payload.get("api_app_id"))
         user = payload.get("user") or {}
+        user_id = _slack_payload_user_id(user)
+        if not _is_wavelength_allowed_slack_user(user_id):
+            logger.info("Ignoring Wavelength interaction for non-allowed user %s.", user_id)
+            return JSONResponse({"ok": True, "text": WAVELENGTH_ACCESS_DENIED_TEXT})
         action = (payload.get("actions") or [{}])[0]
         action_id = str(action.get("action_id") or "")
         if action_id.startswith("wavelength_example:"):
@@ -2725,7 +3466,10 @@ def _add_slack_routes(app, service) -> None:
                 from slack_format import source_reference, work_object_entities
 
                 work_objects = work_object_entities(
-                    [source_reference(source, 1)], include_full_text=True,
+                    [source_reference(source, 1)],
+                    include_full_text=True,
+                    include_excerpt=True,
+                    include_collectiveaccess=True,
                 )
                 if work_objects:
                     work_object = work_objects[0]
@@ -2867,6 +3611,9 @@ except ModuleNotFoundError as exc:
     }
     if exc.name not in optional_runtime_modules:
         raise
+    app = None
+except KeyError as exc:
+    logger.warning("Skipping Wavelength app startup; missing environment variable %s.", exc)
     app = None
 
 

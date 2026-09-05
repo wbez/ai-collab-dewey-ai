@@ -12,7 +12,7 @@ FOOTNOTE_PATTERN = re.compile(r"\[(?P<num>\d+)(?P<suffix>[a-z])?\]")
 WBEZ_WORK_OBJECT_ICON_URL = "https://mchonofsky-test-bucket.s3.us-east-2.amazonaws.com/wbez.jpg"
 CST_WORK_OBJECT_ICON_URL = "https://mchonofsky-test-bucket.s3.us-east-2.amazonaws.com/cst.jpg"
 # When we previously emitted `<url|[1]>` mrkdwn, normalize back to `[1]` so we
-# can render a Work Object mention element.
+# can render a source attachment mention element.
 SLACK_LINKED_FOOTNOTE_PATTERN = re.compile(r"<[^>|]+\|(?P<label>\[(?:\d+)(?:[a-z])?\])>")
 HTML_CITATION_PATTERN = re.compile(
     r'<a\s+href="([^"]+)"[^>]*>(\[\d+\])</a>',
@@ -21,6 +21,13 @@ HTML_CITATION_PATTERN = re.compile(
 MARKDOWN_LINK_PATTERN = re.compile(r"(?<!!)\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
 MARKDOWN_BOLD_PATTERN = re.compile(r"\*\*([^*\n][\s\S]*?[^*\n])\*\*")
 SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])")
+ORDERED_LIST_LINE_PATTERN = re.compile(r"^\s*\d+[.)]\s+(.+)$")
+UNORDERED_LIST_LINE_PATTERN = re.compile(r"^\s*[-*+]\s+(.+)$")
+VTT_TIMING_PATTERN = re.compile(
+    r"(?P<start>\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2}\.\d{3})"
+)
+VOICE_TAG_PATTERN = re.compile(r"^<v\s+([^>]+)>(.*?)(?:</v>)?$", re.IGNORECASE | re.DOTALL)
+SPEAKER_PREFIX_PATTERN = re.compile(r"^([^:\n]{1,80}):\s*(.+)$", re.DOTALL)
 
 
 def slack_link_url(url: str) -> str:
@@ -171,15 +178,14 @@ def _source_authors(source: Dict[str, Any]) -> List[str]:
     return []
 
 
-def _source_guests(source: Dict[str, Any]) -> List[str]:
-    guests = source.get("guests") or []
-    if isinstance(guests, str):
-        guests = [guests]
-    if not isinstance(guests, list):
+def _filtered_names(values: Any) -> List[str]:
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
         return []
     filtered = []
-    for guest in guests:
-        name = str(guest or "").strip()
+    for value in values:
+        name = str(value or "").strip()
         if not name:
             continue
         lower = name.lower()
@@ -191,28 +197,56 @@ def _source_guests(source: Dict[str, Any]) -> List[str]:
     return filtered
 
 
-def _collectiveaccess_links(source: Dict[str, Any]) -> Optional[str]:
+def _source_speakers(source: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    names.extend(_filtered_names(source.get("speakers") or []))
+    for passage in source.get("passages") or []:
+        if isinstance(passage, dict):
+            names.extend(_filtered_names(passage.get("speakers") or []))
+    return list(dict.fromkeys(names))
+
+
+def _collectiveaccess_link(source: Dict[str, Any]) -> Optional[str]:
     occurrence_id = str(source.get("occurrence_id") or "").strip()
-    object_id = str(
-        source.get("object_id")
-        or source.get("parent_id")
-        or source.get("archive_object_id")
-        or ""
-    ).strip()
-    if not occurrence_id and not object_id:
+    if not occurrence_id:
         return None
-    parts = []
-    if occurrence_id:
-        parts.append(
-            "Occurrence: "
-            + f"https://archives.wbez.org/index.php/editor/occurrences/OccurrenceEditor/Edit/occurrence_id/{occurrence_id}"
-        )
-    if object_id:
-        parts.append(
-            "Object: "
-            + f"https://archives.wbez.org/index.php/editor/objects/ObjectEditor/Edit/object_id/{object_id}"
-        )
-    return " / ".join(parts) if parts else None
+    return (
+        "https://archives.wbez.org/index.php/editor/occurrences/"
+        f"OccurrenceEditor/Summary/occurrence_id/{occurrence_id}"
+    )
+
+
+def _format_mmss(seconds: Any) -> Optional[str]:
+    if not isinstance(seconds, (int, float)):
+        return None
+    total_seconds = max(0, int(round(float(seconds))))
+    minutes, secs = divmod(total_seconds, 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def source_time(source: Dict[str, Any]) -> Optional[str]:
+    starts: List[float] = []
+    ends: List[float] = []
+    for key, values in (("start_seconds", starts), ("end_seconds", ends)):
+        value = source.get(key)
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+    for passage in source.get("passages") or []:
+        if not isinstance(passage, dict):
+            continue
+        start = passage.get("start_seconds")
+        end = passage.get("end_seconds")
+        if isinstance(start, (int, float)):
+            starts.append(float(start))
+        if isinstance(end, (int, float)):
+            ends.append(float(end))
+    if not starts and not ends:
+        return None
+    start_text = _format_mmss(min(starts)) if starts else None
+    end_text = _format_mmss(max(ends)) if ends else None
+    if start_text and end_text:
+        return f"{start_text}-{end_text}"
+    return start_text or end_text
 
 
 def source_title(source: Dict[str, Any]) -> str:
@@ -229,6 +263,16 @@ def source_title(source: Dict[str, Any]) -> str:
 
 
 def source_url(source: Dict[str, Any]) -> Optional[str]:
+    if _is_transcript(source):
+        for key in ("transcript_url", "url"):
+            value = source.get(key)
+            if value:
+                return str(value)
+        recording_urls = source.get("recording_urls") or []
+        if isinstance(recording_urls, list):
+            for value in recording_urls:
+                if value:
+                    return str(value)
     for key in ("citation_url", "transcript_url", "url"):
         value = source.get(key)
         if value:
@@ -265,7 +309,71 @@ def source_excerpt(source: Dict[str, Any], limit: int = 16) -> str:
     return " ".join(words[:limit]) + "…"
 
 
+def _parse_vtt_timestamp(value: str) -> Optional[float]:
+    try:
+        hours, minutes, seconds = value.split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_transcript_text(value: str) -> tuple[Optional[str], str]:
+    value = value.strip()
+    voice = VOICE_TAG_PATTERN.match(value)
+    if voice:
+        return (
+            re.sub(r"\s+", " ", voice.group(1)).strip(),
+            re.sub(r"\s+", " ", re.sub(r"</v>", "", voice.group(2))).strip(),
+        )
+    value = re.sub(r"</?v[^>]*>", "", value).strip()
+    prefix = SPEAKER_PREFIX_PATTERN.match(value)
+    if prefix:
+        return re.sub(r"\s+", " ", prefix.group(1)).strip(), re.sub(r"\s+", " ", prefix.group(2)).strip()
+    return None, re.sub(r"\s+", " ", value).strip()
+
+
+def format_transcript_excerpt_text(text: Any) -> str:
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return ""
+    blocks = re.split(r"\n{2,}", raw)
+    formatted: List[str] = []
+    for block in blocks:
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        timing = VTT_TIMING_PATTERN.match(lines[0])
+        if not timing:
+            formatted.append(work_object_description_text(block, 2000))
+            continue
+        start = _parse_vtt_timestamp(timing.group("start"))
+        end = _parse_vtt_timestamp(timing.group("end"))
+        time_text = ""
+        if start is not None and end is not None:
+            time_text = f"{_format_mmss(start)}-{_format_mmss(end)}"
+        speaker, cue_text = _clean_transcript_text(" ".join(lines[1:]))
+        if speaker and cue_text:
+            formatted.append(f"{time_text} {speaker}: {cue_text}".strip())
+        elif cue_text:
+            formatted.append(f"{time_text} {cue_text}".strip())
+    return truncate_text("\n\n".join(formatted), 12000)
+
+
 def source_full_text(source: Dict[str, Any]) -> str:
+    if _is_transcript(source):
+        raw = source.get("raw_vtt_excerpt")
+        if raw:
+            return format_transcript_excerpt_text(raw)
+        passages = source.get("passages") or []
+        if isinstance(passages, list):
+            chunks = [
+                format_transcript_excerpt_text(passage.get("raw_vtt_excerpt"))
+                for passage in passages
+                if isinstance(passage, dict) and passage.get("raw_vtt_excerpt")
+            ]
+            text = "\n\n".join(chunk for chunk in chunks if chunk)
+            if text:
+                return text
     content = source.get("chunk_text") if source.get("content_type") == "transcript" else source.get("content")
     if content:
         return str(content)
@@ -282,20 +390,19 @@ def source_full_text(source: Dict[str, Any]) -> str:
     return "\n\n".join(value for value in chunks if value)
 
 
-def source_reference(source: Dict[str, Any], index: int) -> Dict[str, Any]:
-    publish_date = source.get("publish_date") or source.get("published_at") or source.get("publication_date") or source.get("date")
-    if hasattr(publish_date, "isoformat"):
-        publish_date = publish_date.isoformat()
+def work_object_external_id(source: Dict[str, Any], index: Optional[int] = None) -> str:
     # Prefer IDs that the archive can look up again (used by Work Objects and
     # "Open" actions). In particular, avoid defaulting to a URL-like "source_id"
     # when a stable archive identifier is available.
     stable_id_candidates = [
+        source.get("shared_source_id"),
         source.get("parent_id"),
         source.get("chunk_id"),
         source.get("occurrence_id"),
         source.get("source_id"),
         source.get("id"),
         index,
+        source_url(source),
     ]
     stable_id: str = ""
     for candidate in stable_id_candidates:
@@ -312,6 +419,14 @@ def source_reference(source: Dict[str, Any], index: int) -> Dict[str, Any]:
         url = source_url(source) or stable_id
         digest = sha256(url.encode("utf-8", errors="ignore")).hexdigest()[:20]
         stable_id = f"src_{digest}"
+    return stable_id
+
+
+def source_reference(source: Dict[str, Any], index: int) -> Dict[str, Any]:
+    publish_date = source.get("publish_date") or source.get("published_at") or source.get("publication_date") or source.get("date")
+    if hasattr(publish_date, "isoformat"):
+        publish_date = publish_date.isoformat()
+    stable_id = work_object_external_id(source, index)
     return {
         "id": stable_id,
         "source_id": stable_id,
@@ -324,8 +439,10 @@ def source_reference(source: Dict[str, Any], index: int) -> Dict[str, Any]:
         "excerpt": source_excerpt(source),
         "full_text": source_full_text(source),
         "authors": source.get("authors") or [],
+        "speakers": source.get("speakers") or [],
         "program": source.get("program"),
         "guests": source.get("guests") or [],
+        "time": source_time(source),
         "occurrence_id": source.get("occurrence_id"),
         "parent_id": source.get("parent_id"),
         "passages": source.get("passages") or [],
@@ -333,7 +450,44 @@ def source_reference(source: Dict[str, Any], index: int) -> Dict[str, Any]:
 
 
 def source_references(results: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [source_reference(source, index) for index, source in enumerate(results, 1)]
+    rows = [source for source in results if isinstance(source, dict)]
+    transcript_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for source in rows:
+        if not _is_transcript(source):
+            continue
+        recording_id = str(
+            source.get("parent_id")
+            or source.get("source_id")
+            or source.get("occurrence_id")
+            or source.get("transcript_name")
+            or ""
+        ).strip()
+        chunk_id = str(source.get("chunk_id") or "").strip()
+        if recording_id and chunk_id:
+            transcript_groups.setdefault(recording_id, []).append(source)
+
+    shared_ids: Dict[int, str] = {}
+    for recording_id, sources in transcript_groups.items():
+        if len(sources) < 2:
+            continue
+        chunk_parts: List[str] = []
+        for source in sources:
+            chunk_id = str(source.get("chunk_id") or "").strip()
+            prefix = f"{recording_id}-"
+            chunk_parts.append(chunk_id[len(prefix):] if chunk_id.startswith(prefix) else chunk_id)
+        shared_id = f"{recording_id}-{','.join(dict.fromkeys(chunk_parts))}"
+        for source in sources:
+            shared_ids[id(source)] = shared_id
+
+    return [
+        source_reference(
+            {**source, "shared_source_id": shared_ids[id(source)]}
+            if id(source) in shared_ids
+            else source,
+            index,
+        )
+        for index, source in enumerate(rows, 1)
+    ]
 
 
 def cited_source_references(answer: str, sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -345,7 +499,7 @@ def cited_source_references(answer: str, sources: Iterable[Dict[str, Any]]) -> L
         source = by_number.get(int(match.group(1)))
         if not source:
             continue
-        key = source.get("url") or f"src:{source['number']}"
+        key = source.get("source_id") or source.get("url") or f"src:{source['number']}"
         if key in displayed_keys:
             continue
         displayed_keys.add(key)
@@ -371,46 +525,270 @@ def split_mrkdwn(text: str, limit: int = 2900) -> List[str]:
         chunks.append(remaining)
     return chunks
 
-def _rich_text_elements_for_chunk(
-    chunk: str,
+def _merge_styles(*styles: Optional[Dict[str, bool]]) -> Dict[str, bool]:
+    merged: Dict[str, bool] = {}
+    for style in styles:
+        if style:
+            merged.update(style)
+    return merged
+
+
+def _text_element(text: str, style: Optional[Dict[str, bool]] = None) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    element: Dict[str, Any] = {"type": "text", "text": text}
+    if style:
+        element["style"] = style
+    return element
+
+
+def _append_text_element(
+    elements: List[Dict[str, Any]],
+    text: str,
+    style: Optional[Dict[str, bool]] = None,
+) -> None:
+    element = _text_element(text, style)
+    if not element:
+        return
+    if (
+        elements
+        and elements[-1].get("type") == "text"
+        and elements[-1].get("style") == element.get("style")
+    ):
+        elements[-1]["text"] = str(elements[-1].get("text") or "") + text
+        return
+    elements.append(element)
+
+
+def _attachment_mention_element(
+    label: str,
+    source: Dict[str, Any],
+    *,
+    work_object_app_id: Optional[str],
+    attachment_locations: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not work_object_app_id:
+        return None
+    entity_id = work_object_external_id(source)
+    url = source.get("url")
+    if not entity_id or not url:
+        return None
+    location = (attachment_locations or {}).get(entity_id) or {}
+    if not location.get("channel_id") or not location.get("ts"):
+        return None
+    mention = {
+        "type": "attachment_mention",
+        "entity_id": entity_id,
+        "app_id": str(work_object_app_id),
+        "text": label,
+        "url": slack_link_url(str(url)),
+        "icon_url": WBEZ_WORK_OBJECT_ICON_URL if _is_wbez(source) else CST_WORK_OBJECT_ICON_URL,
+        "channel_id": str(location["channel_id"]),
+        "ts": str(location["ts"]),
+    }
+    return mention
+
+
+def _find_next_inline_token(text: str, start: int) -> Optional[tuple[int, int, str, Any]]:
+    candidates: List[tuple[int, int, str, Any]] = []
+
+    for delimiter, token_type in (("**", "bold"), ("__", "underline"), ("_", "italic"), ("*", "italic")):
+        token_start = text.find(delimiter, start)
+        if token_start == -1:
+            continue
+        if delimiter in {"_", "*"}:
+            if token_start > 0 and text[token_start - 1].isalnum():
+                continue
+            if token_start + 1 < len(text) and text[token_start + 1].isspace():
+                continue
+        token_end = text.find(delimiter, token_start + len(delimiter))
+        if token_end == -1 or token_end == token_start + len(delimiter):
+            continue
+        if delimiter in {"_", "*"} and token_end + 1 < len(text) and text[token_end + 1].isalnum():
+            continue
+        candidates.append((token_start, token_end + len(delimiter), token_type, (delimiter, token_end)))
+
+    for opener, closer, token_type in (("<u>", "</u>", "underline"),):
+        token_start = text.find(opener, start)
+        if token_start == -1:
+            continue
+        token_end = text.find(closer, token_start + len(opener))
+        if token_end == -1 or token_end == token_start + len(opener):
+            continue
+        candidates.append((token_start, token_end + len(closer), token_type, (opener, closer, token_end)))
+
+    link_match = MARKDOWN_LINK_PATTERN.search(text, start)
+    if link_match:
+        candidates.append((link_match.start(), link_match.end(), "link", link_match))
+
+    slack_link_match = re.search(r"<(https?://[^>|]+)\|([^>\n]+)>", text[start:])
+    if slack_link_match:
+        candidates.append((
+            start + slack_link_match.start(),
+            start + slack_link_match.end(),
+            "slack_link",
+            slack_link_match,
+        ))
+
+    footnote_match = FOOTNOTE_PATTERN.search(text, start)
+    if footnote_match:
+        candidates.append((footnote_match.start(), footnote_match.end(), "footnote", footnote_match))
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+
+
+def _rich_text_inline_elements(
+    text: str,
     *,
     sources_by_number: Dict[int, Dict[str, Any]],
-    work_object_app_id: str,
+    work_object_app_id: Optional[str],
+    attachment_locations: Optional[Dict[str, Dict[str, str]]] = None,
+    style: Optional[Dict[str, bool]] = None,
 ) -> List[Dict[str, Any]]:
     elements: List[Dict[str, Any]] = []
     cursor = 0
-    for match in FOOTNOTE_PATTERN.finditer(chunk or ""):
-        start, end = match.span()
+    while cursor < len(text):
+        token = _find_next_inline_token(text, cursor)
+        if not token:
+            _append_text_element(elements, text[cursor:], style)
+            break
+        start, end, token_type, data = token
         if start > cursor:
-            elements.append({"type": "text", "text": chunk[cursor:start]})
-        label = match.group(0)
-        number = int(match.group("num"))
-        source = sources_by_number.get(number)
-        if source and source.get("url") and (source.get("source_id") or source.get("id")):
-            mention: Dict[str, Any] = {
-                "type": "work_object_mention",
-                "entity_id": str(source.get("source_id") or source.get("id")),
-                "app_id": str(work_object_app_id),
+            _append_text_element(elements, text[cursor:start], style)
+
+        if token_type in {"bold", "italic", "underline"}:
+            if token_type == "underline" and data[0] == "<u>":
+                inner_start = start + len(data[0])
+                inner_end = data[2]
+            else:
+                delimiter, inner_end = data
+                inner_start = start + len(delimiter)
+            nested_style = _merge_styles(style, {token_type: True})
+            elements.extend(
+                _rich_text_inline_elements(
+                    text[inner_start:inner_end],
+                    sources_by_number=sources_by_number,
+                    work_object_app_id=work_object_app_id,
+                    attachment_locations=attachment_locations,
+                    style=nested_style,
+                )
+            )
+        elif token_type == "link":
+            match = data
+            label = html.unescape(match.group(1))
+            url = html.unescape(match.group(2))
+            element: Dict[str, Any] = {
+                "type": "link",
+                "url": slack_link_url(url),
                 "text": label,
-                "url": slack_link_url(str(source["url"])),
-                "icon_url": WBEZ_WORK_OBJECT_ICON_URL if _is_wbez(source) else CST_WORK_OBJECT_ICON_URL 
             }
-            elements.append(mention)
-        else:
-            elements.append({"type": "text", "text": label})
+            if style:
+                element["style"] = style
+            elements.append(element)
+        elif token_type == "slack_link":
+            match = data
+            url = html.unescape(match.group(1))
+            label = html.unescape(match.group(2))
+            element = {
+                "type": "link",
+                "url": slack_link_url(url),
+                "text": label,
+            }
+            if style:
+                element["style"] = style
+            elements.append(element)
+        elif token_type == "footnote":
+            match = data
+            label = match.group(0)
+            source = sources_by_number.get(int(match.group("num")))
+            mention = _attachment_mention_element(
+                label,
+                source,
+                work_object_app_id=work_object_app_id,
+                attachment_locations=attachment_locations,
+            ) if source else None
+            if mention:
+                elements.append(mention)
+            else:
+                _append_text_element(elements, label, style)
         cursor = end
-    if cursor < len(chunk):
-        elements.append({"type": "text", "text": chunk[cursor:]})
     return elements
 
 def _is_wbez(source):
     return _is_transcript(source) or "wbez.org" in str(source.get("url") or "")
+
+
+def _rich_text_section(
+    text: str,
+    sources_by_number: Dict[int, Dict[str, Any]],
+    work_object_app_id: Optional[str],
+    attachment_locations: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    return {
+        "type": "rich_text_section",
+        "elements": _rich_text_inline_elements(
+            text,
+            sources_by_number=sources_by_number,
+            work_object_app_id=work_object_app_id,
+            attachment_locations=attachment_locations,
+        ) or [{"type": "text", "text": ""}],
+    }
+
+
+def _markdown_rich_text_elements(
+    text: str,
+    *,
+    sources_by_number: Dict[int, Dict[str, Any]],
+    work_object_app_id: Optional[str],
+    attachment_locations: Optional[Dict[str, Dict[str, str]]] = None,
+) -> List[Dict[str, Any]]:
+    rich_elements: List[Dict[str, Any]] = []
+    pending_list_style: Optional[str] = None
+    pending_list_items: List[Dict[str, Any]] = []
+
+    def flush_list() -> None:
+        nonlocal pending_list_style, pending_list_items
+        if pending_list_style and pending_list_items:
+            rich_elements.append({
+                "type": "rich_text_list",
+                "style": pending_list_style,
+                "elements": pending_list_items,
+            })
+        pending_list_style = None
+        pending_list_items = []
+
+    for line in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        unordered_match = UNORDERED_LIST_LINE_PATTERN.match(line)
+        ordered_match = ORDERED_LIST_LINE_PATTERN.match(line)
+        if unordered_match or ordered_match:
+            list_style = "bullet" if unordered_match else "ordered"
+            item_text = (unordered_match or ordered_match).group(1)
+            if pending_list_style != list_style:
+                flush_list()
+                pending_list_style = list_style
+            pending_list_items.append(
+                _rich_text_section(item_text, sources_by_number, work_object_app_id, attachment_locations)
+            )
+            continue
+
+        flush_list()
+        if not line.strip():
+            if rich_elements:
+                rich_elements.append(_rich_text_section("\n", {}, None))
+            continue
+        rich_elements.append(_rich_text_section(line, sources_by_number, work_object_app_id, attachment_locations))
+
+    flush_list()
+    return rich_elements
 
 def answer_blocks(
     answer: str,
     sources: List[Dict[str, Any]],
     *,
     work_object_app_id: Optional[str] = None,
+    attachment_locations: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
     sources_by_number = {
@@ -419,29 +797,70 @@ def answer_blocks(
         if isinstance(source, dict)
         and str(source.get("number") or "").isdigit()
     }
-    use_work_object_mentions = bool(work_object_app_id) and bool(sources_by_number)
     for chunk in split_mrkdwn(answer):
-        if use_work_object_mentions:
-            chunk = SLACK_LINKED_FOOTNOTE_PATTERN.sub(lambda m: m.group("label"), chunk)
-            blocks.append(
-                {
-                    "type": "rich_text",
-                    "elements": [
-                        {
-                            "type": "rich_text_section",
-                            "elements": _rich_text_elements_for_chunk(
-                                chunk,
-                                sources_by_number=sources_by_number,
-                                work_object_app_id=str(work_object_app_id),
-                            ),
-                        }
-                    ],
-                }
-            )
-        else:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+        chunk = SLACK_LINKED_FOOTNOTE_PATTERN.sub(lambda m: m.group("label"), chunk)
+        blocks.append({
+            "type": "rich_text",
+            "elements": _markdown_rich_text_elements(
+                chunk,
+                sources_by_number=sources_by_number,
+                work_object_app_id=work_object_app_id,
+                attachment_locations=attachment_locations,
+            ),
+        })
 
     return blocks[:50]
+
+
+def source_attachment_blocks(
+    sources: List[Dict[str, Any]],
+    *,
+    work_object_app_id: Optional[str],
+) -> Optional[List[Dict[str, Any]]]:
+    if not sources or not work_object_app_id:
+        return None
+
+    elements: List[Dict[str, Any]] = [
+        {"type": "text", "text": "Sources:", "style": {"bold": True}},
+    ]
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        entity_id = work_object_external_id(source)
+        url = source.get("url")
+        if not entity_id or not url:
+            continue
+        title = str(source.get("title") or "Archive source").strip() or "Archive source"
+        display_id = str(source.get("number") or "").strip()
+        label = f"[{display_id}] " if display_id else ""
+        elements.extend(
+            [
+                {"type": "text", "text": "\n"},
+                {"type": "text", "text": label},
+                {
+                    "type": "attachment_mention",
+                    "entity_id": entity_id,
+                    "app_id": str(work_object_app_id),
+                    "text": title,
+                    "url": slack_link_url(str(url)),
+                    "icon_url": WBEZ_WORK_OBJECT_ICON_URL if _is_wbez(source) else CST_WORK_OBJECT_ICON_URL,
+                },
+            ]
+        )
+
+    if len(elements) == 1:
+        return None
+    return [
+        {
+            "type": "rich_text",
+            "elements": [
+                {
+                    "type": "rich_text_section",
+                    "elements": elements,
+                }
+            ],
+        }
+    ]
 
 def work_object_entities(
     sources: List[Dict[str, Any]],
@@ -450,10 +869,10 @@ def work_object_entities(
     include_excerpt: bool = False,
     include_collectiveaccess: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Build Content Item Work Object metadata for cited archive sources."""
+    """Build Item Work Object metadata for cited archive sources."""
     entities = []
     for source in sources:
-        external_id = str(source.get("source_id") or source.get("id"))
+        external_id = work_object_external_id(source)
         url = source.get("url")
         if not external_id or not url:
             continue
@@ -467,7 +886,7 @@ def work_object_entities(
             header_title = title_text
 
         date_value = _parse_date(source.get("publish_date"))
-        icon_url = WBEZ_WORK_OBJECT_ICON_URL if transcript else CST_WORK_OBJECT_ICON_URL
+        icon_url = WBEZ_WORK_OBJECT_ICON_URL if _is_wbez(source) else CST_WORK_OBJECT_ICON_URL
         product_icon = {"url": icon_url, "alt_text": "WBEZ" if transcript else "CST"} if icon_url else None
         custom_fields: List[Dict[str, Any]] = [
             {
@@ -487,29 +906,39 @@ def work_object_entities(
                 }
             )
         if transcript:
-            guests = _source_guests(source)
-            if guests:
-                shortlist = guests[:3]
-                guests_text = ", ".join(shortlist) + ("..." if len(guests) > 3 else "")
+            time_text = source_time(source)
+            if time_text:
                 custom_fields.append(
                     {
-                        "key": "guests",
-                        "label": "Guests",
-                        "value": guests_text,
+                        "key": "time",
+                        "label": "Time",
+                        "value": time_text,
+                        "type": "string",
+                    }
+                )
+            speakers = _source_speakers(source)
+            if speakers:
+                shortlist = speakers[:5]
+                speakers_text = ", ".join(shortlist) + ("..." if len(speakers) > 5 else "")
+                custom_fields.append(
+                    {
+                        "key": "speakers",
+                        "label": "Speakers",
+                        "value": speakers_text,
                         "type": "string",
                     }
                 )
             if include_collectiveaccess:
-                ca_links = _collectiveaccess_links(source)
-                if ca_links:
+                ca_link = _collectiveaccess_link(source)
+                if ca_link:
                     custom_fields.append(
                         {
                             "key": "collectiveaccess",
                             "label": "CollectiveAccess",
-                            "value": ca_links,
-                            "type": "string",
+                            "value": ca_link,
+                            "type": "slack#/types/link",
                         }
-                    )
+                )
         else:
             authors = _source_authors(source)
             if authors:
@@ -523,6 +952,7 @@ def work_object_entities(
                         "type": "string",
                     }
                 )
+        excerpt_value = ""
         if include_excerpt:
             excerpt_value = truncate_text(source.get("excerpt") or "", 200)
             if excerpt_value:
@@ -536,21 +966,31 @@ def work_object_entities(
                 )
         if include_full_text and source.get("full_text"):
             body_text = work_object_description_text(source.get("full_text"))
+        elif excerpt_value:
+            body_text = work_object_description_text(excerpt_value, 500)
         else:
             body_text = ""
         display_order = []
         if body_text:
+            custom_fields.append(
+                {
+                    "key": "description",
+                    "label": "Description",
+                    "value": body_text,
+                    "type": "string",
+                }
+            )
             display_order.append("description")
-        display_order.extend(["source_url", "date", "author" if not transcript else "guests"])
+        display_order.extend(["source_url", "date"])
+        display_order.extend(["time", "speakers"] if transcript else ["author"])
         if transcript and include_collectiveaccess:
             display_order.append("collectiveaccess")
         if include_excerpt:
             display_order.append("excerpt")
 
         entities.append({
-            "entity_type": "slack#/entities/content_item",
+            "entity_type": "slack#/entities/item",
             "external_ref": {"id": external_id},
-            "app_unfurl_url": url,
             "url": url,
             "entity_payload": {
                 "attributes": {
@@ -558,14 +998,6 @@ def work_object_entities(
                     "display_type": "Transcript" if transcript else "Article",
                     "display_id": str(source.get("number", "")),
                     **({"product_icon": product_icon} if product_icon else {}),
-                },
-                "fields": {
-                    **({
-                        "description": {
-                            "value": body_text,
-                            "format": "markdown",
-                        }
-                    } if body_text else {}),
                 },
                 "custom_fields": custom_fields,
                 "display_order": display_order,

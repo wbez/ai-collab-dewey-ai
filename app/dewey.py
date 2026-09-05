@@ -5,6 +5,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Dict, List, Optional
+from urllib.parse import unquote, urlparse
 
 try:
     from azure.core.exceptions import HttpResponseError, ServiceRequestError
@@ -369,6 +370,16 @@ class Dewey:
         return sources
 
     def _resolve_source_url(self, source_data: Dict[str, object]) -> Optional[str]:
+        if source_data.get("content_type") == "transcript":
+            transcript_url = source_data.get("transcript_url")
+            if transcript_url:
+                return str(transcript_url)
+            recording_urls = source_data.get("recording_urls") or []
+            if isinstance(recording_urls, list):
+                for value in recording_urls:
+                    if value:
+                        return str(value)
+
         citation_url = source_data.get("citation_url")
         if citation_url:
             return str(citation_url)
@@ -486,6 +497,7 @@ class Dewey:
         if not escaped_source_id:
             return None
         filter_text = (
+            f"source_id eq '{escaped_source_id}' or "
             f"chunk_id eq '{escaped_source_id}' or "
             f"occurrence_id eq '{escaped_source_id}' or "
             f"parent_id eq '{escaped_source_id}'"
@@ -497,6 +509,52 @@ class Dewey:
             vector_queries=None,
         )
         return results[0] if results else None
+
+    def get_source_by_url(self, url: str):
+        normalized_url = self._normalize_lookup_url(url)
+        if not normalized_url:
+            return None
+
+        query = self._url_lookup_query(normalized_url)
+        if not query:
+            return None
+
+        results = self._search_documents(
+            {},
+            search_text=query,
+            vector_queries=None,
+            search_top=25,
+        )
+        for result in results:
+            for key in ("citation_url", "url", "transcript_url"):
+                if self._normalize_lookup_url(result.get(key)) == normalized_url:
+                    return result
+            recording_urls = result.get("recording_urls") or []
+            if isinstance(recording_urls, list) and any(
+                self._normalize_lookup_url(value) == normalized_url
+                for value in recording_urls
+            ):
+                return result
+        return None
+
+    def _normalize_lookup_url(self, url: object) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return ""
+        parsed = urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw.rstrip("/")
+        path = parsed.path.rstrip("/") or "/"
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+
+    def _url_lookup_query(self, url: str) -> str:
+        parsed = urlparse(url)
+        tokens = [
+            token
+            for token in re.split(r"[^A-Za-z0-9]+", unquote(parsed.path))
+            if len(token) > 1 and token.lower() not in STOP_WORDS
+        ]
+        return " ".join(tokens[-12:])
 
     def format_sources(self, results):
         return self._format_sources(results)
