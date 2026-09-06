@@ -58,6 +58,7 @@
       "bot_events": [
         "app_mention",
         "app_home_opened",
+        "entity_details_requested",
         "message.im"
       ]
     },

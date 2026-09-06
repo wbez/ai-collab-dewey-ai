@@ -1,4 +1,5 @@
 import hmac
+import html
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from functools import lru_cache, partial
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote, urlencode
 from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Optional, Set
 
@@ -49,6 +50,7 @@ MCP_SERVER_CODE_VERSION = "slack-home-v1"
 WORK_OBJECT_CACHE_MAX = 2000
 WORK_OBJECT_CACHE_TTL_SECONDS = 60 * 60 * 24
 SLACK_WORK_OBJECT_METADATA_MAX_BYTES = 3950
+WORK_OBJECT_EMBED_TOKEN_TTL_SECONDS = 10 * 60
 _WORK_OBJECT_ENTITY_CACHE: "OrderedDict[str, tuple[float, Dict[str, Any]]]" = OrderedDict()
 _WORK_OBJECT_SOURCE_CACHE: "OrderedDict[str, tuple[float, Dict[str, Any]]]" = OrderedDict()
 
@@ -65,6 +67,96 @@ def _team_api_app_id(team_id: Optional[str]) -> Optional[str]:
     if not team_id:
         return None
     return _TEAM_API_APP_ID.get(str(team_id))
+
+
+def _bool_env(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _work_object_embeds_enabled() -> bool:
+    base_url = (os.environ.get("WAVELENGTH_PUBLIC_BASE_URL") or "").strip()
+    signing_secret = (os.environ.get("WAVELENGTH_EMBED_SIGNING_SECRET") or "").strip()
+    return bool(
+        base_url.startswith("https://")
+        and signing_secret
+        and _bool_env("WAVELENGTH_WORK_OBJECT_EMBEDS", default=True)
+    )
+
+
+def _work_object_embed_signature(path: str, exp: int) -> str:
+    secret = (os.environ.get("WAVELENGTH_EMBED_SIGNING_SECRET") or "").strip()
+    if not secret:
+        return ""
+    data = f"{path}?{urlencode({'exp': str(exp)})}"
+    return hmac.new(secret.encode("utf-8"), data.encode("utf-8"), sha256).hexdigest()
+
+
+def _work_object_embed_preview_url(source_id: str, *, now: Optional[float] = None) -> Optional[str]:
+    if not _work_object_embeds_enabled():
+        return None
+    source_id = str(source_id or "").strip()
+    if not source_id:
+        return None
+    base_url = (os.environ.get("WAVELENGTH_PUBLIC_BASE_URL") or "").rstrip("/")
+    path = f"/slack/work-objects/embed/{quote(source_id, safe='')}"
+    exp = int(now or time.time()) + WORK_OBJECT_EMBED_TOKEN_TTL_SECONDS
+    sig = _work_object_embed_signature(path, exp)
+    if not sig:
+        return None
+    return f"{base_url}{path}?{urlencode({'exp': str(exp), 'sig': sig})}"
+
+
+def _verify_work_object_embed_token(path: str, exp: Any, sig: Any, *, now: Optional[float] = None) -> bool:
+    try:
+        exp_int = int(str(exp or ""))
+    except ValueError:
+        return False
+    if exp_int < int(now or time.time()):
+        return False
+    expected = _work_object_embed_signature(path, exp_int)
+    return bool(expected and sig and hmac.compare_digest(expected, str(sig)))
+
+
+def _add_embed_preview_url_to_work_object(
+    work_object: Dict[str, Any],
+    source_id: Optional[str],
+) -> Dict[str, Any]:
+    preview_url = _work_object_embed_preview_url(str(source_id or ""))
+    if not preview_url:
+        return work_object
+    entity_payload = (
+        dict(work_object.get("entity_payload"))
+        if isinstance(work_object.get("entity_payload"), dict)
+        else {}
+    )
+    attributes = (
+        dict(entity_payload.get("attributes"))
+        if isinstance(entity_payload.get("attributes"), dict)
+        else {}
+    )
+    full_size_preview = (
+        dict(attributes.get("full_size_preview"))
+        if isinstance(attributes.get("full_size_preview"), dict)
+        else {}
+    )
+    from slack_format import SLACK_WORK_OBJECT_EMBED_MIME_TYPE
+
+    attributes["full_size_preview"] = {
+        **full_size_preview,
+        "is_supported": True,
+        "mime_type": SLACK_WORK_OBJECT_EMBED_MIME_TYPE,
+        "preview_url": preview_url,
+    }
+    return {
+        **work_object,
+        "entity_payload": {
+            **entity_payload,
+            "attributes": attributes,
+        },
+    }
 
 
 def _verbose_logging_enabled() -> bool:
@@ -179,6 +271,107 @@ def _cached_work_object_source(external_id: Optional[str]) -> Optional[Dict[str,
         return None
     _WORK_OBJECT_SOURCE_CACHE.move_to_end(external_id)
     return dict(source)
+
+
+def _work_object_source_detail(service: Any, source_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not source_id:
+        return None
+    source_id = str(source_id)
+    cached = _cached_work_object_source(source_id)
+    if cached:
+        return cached
+    engine = getattr(service, "engine", None)
+    if not engine or not hasattr(engine, "get_source"):
+        return None
+    try:
+        raw_source = engine.get_source(source_id)
+    except Exception:
+        logger.exception("Could not fetch Work Object embed source: source_id=%s", source_id)
+        return None
+    if not raw_source:
+        return None
+    from slack_format import source_reference
+
+    source_detail = source_reference(raw_source, 1)
+    _cache_work_object_sources([source_detail])
+    return source_detail
+
+
+def _render_work_object_embed_html(source: Dict[str, Any]) -> str:
+    title = str(source.get("title") or "Archive source").strip() or "Archive source"
+    content_type = str(source.get("content_type") or "source").strip()
+    publish_date = str(source.get("publish_date") or "").strip()
+    url = str(source.get("url") or "").strip()
+    full_text = str(source.get("full_text") or source.get("excerpt") or "").strip()
+    authors = source.get("authors") or []
+    speakers = source.get("speakers") or []
+    names = authors if isinstance(authors, list) and authors else speakers
+    names_text = ", ".join(str(name) for name in names if str(name).strip())
+    meta_parts = [part for part in (content_type.title(), publish_date, names_text) if part]
+    body = html.escape(full_text) if full_text else "No source text is available for this item."
+    source_link = (
+        f'<a class="source-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">'
+        "Open original source</a>"
+        if url.startswith(("http://", "https://"))
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: light dark;
+      font-family: Arial, Helvetica, sans-serif;
+      line-height: 1.45;
+      background: Canvas;
+      color: CanvasText;
+    }}
+    body {{
+      margin: 0;
+      padding: 24px;
+    }}
+    main {{
+      max-width: 860px;
+      margin: 0 auto;
+    }}
+    h1 {{
+      font-size: 24px;
+      line-height: 1.2;
+      margin: 0 0 8px;
+    }}
+    .meta {{
+      color: #5f6368;
+      font-size: 14px;
+      margin-bottom: 20px;
+    }}
+    .source-link {{
+      display: inline-block;
+      margin-bottom: 20px;
+      color: #1264a3;
+      font-weight: 600;
+      text-decoration: none;
+    }}
+    pre {{
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-family: inherit;
+      font-size: 15px;
+      margin: 0;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{html.escape(title)}</h1>
+    <div class="meta">{html.escape(" | ".join(meta_parts))}</div>
+    {source_link}
+    <pre>{body}</pre>
+  </main>
+</body>
+</html>"""
 
 
 def _work_object_source_id_from_event(event: Dict[str, Any]) -> Optional[str]:
@@ -404,6 +597,7 @@ def _trim_work_object_entity(entity: Dict[str, Any]) -> Dict[str, Any]:
         title = str(attributes["title"].get("text") or "")
     product_icon = attributes.get("product_icon") if isinstance(attributes, dict) else None
     display_type = attributes.get("display_type") if isinstance(attributes, dict) else None
+    full_size_preview = attributes.get("full_size_preview") if isinstance(attributes, dict) else None
     custom_fields = payload.get("custom_fields") if isinstance(payload.get("custom_fields"), list) else []
     minimal_fields = [
         field
@@ -433,6 +627,7 @@ def _trim_work_object_entity(entity: Dict[str, Any]) -> Dict[str, Any]:
                 **({"display_type": display_type} if display_type else {}),
                 "display_id": str(attributes.get("display_id") or ""),
                 **({"product_icon": product_icon} if product_icon else {}),
+                **({"full_size_preview": full_size_preview} if full_size_preview else {}),
             },
             "custom_fields": minimal_fields,
             "display_order": display_order,
@@ -456,10 +651,20 @@ def _work_object_metadata_batches(
         if _metadata_size({"entities": [candidate_entity]}) > SLACK_WORK_OBJECT_METADATA_MAX_BYTES:
             candidate_entity = _trim_work_object_entity(entity)
         if _metadata_size({"entities": [candidate_entity]}) > SLACK_WORK_OBJECT_METADATA_MAX_BYTES:
+            payload = entity.get("entity_payload") if isinstance(entity.get("entity_payload"), dict) else {}
+            attributes = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
+            full_size_preview = attributes.get("full_size_preview")
             candidate_entity = _trim_work_object_entity({
                 **entity,
                 "entity_payload": {
-                    "attributes": {"title": {"text": ""}},
+                    "attributes": {
+                        "title": {"text": ""},
+                        **(
+                            {"full_size_preview": full_size_preview}
+                            if isinstance(full_size_preview, dict)
+                            else {}
+                        ),
+                    },
                     "custom_fields": [],
                 },
             })
@@ -489,7 +694,12 @@ def _tool_payload_work_object_metadata_batches(payload: Dict[str, Any]) -> List[
 
     sources = (payload.get("structuredContent") or {}).get("sources") or []
     entities = (
-        work_object_entities(sources, include_excerpt=True, include_collectiveaccess=False)
+        work_object_entities(
+            sources,
+            include_excerpt=True,
+            include_collectiveaccess=False,
+            include_embed=_work_object_embeds_enabled(),
+        )
         if isinstance(sources, list)
         else []
     )
@@ -1876,7 +2086,12 @@ def _answer_source_segments(
 def _work_object_metadata_batches_for_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     from slack_format import work_object_entities
 
-    entities = work_object_entities(sources, include_excerpt=True, include_collectiveaccess=False)
+    entities = work_object_entities(
+        sources,
+        include_excerpt=True,
+        include_collectiveaccess=False,
+        include_embed=_work_object_embeds_enabled(),
+    )
     if sources:
         _cache_work_object_sources(sources)
     return _work_object_metadata_batches(entities) if entities else []
@@ -2864,7 +3079,7 @@ def _slack_event_thread_ts(payload: Dict[str, Any]) -> Optional[str]:
 
 def _add_slack_routes(app, service) -> None:
     from starlette.background import BackgroundTask
-    from starlette.responses import JSONResponse, PlainTextResponse
+    from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
     async def slack_health(request):
         checks = {
@@ -2880,6 +3095,27 @@ def _add_slack_routes(app, service) -> None:
                 "code_version": MCP_SERVER_CODE_VERSION,
                 "ready": checks,
             }
+        )
+
+    async def work_object_embed(request):
+        source_id = str(request.path_params.get("source_id") or "").strip()
+        if not _verify_work_object_embed_token(
+            request.url.path,
+            request.query_params.get("exp"),
+            request.query_params.get("sig"),
+        ):
+            return PlainTextResponse("Access denied.", status_code=403)
+        source_detail = _work_object_source_detail(service, source_id)
+        if not source_detail:
+            return PlainTextResponse("Source not found.", status_code=404)
+        return HTMLResponse(
+            _render_work_object_embed_html(source_detail),
+            headers={
+                "Content-Security-Policy": (
+                    "frame-ancestors https://*.slack.com "
+                    "https://*.slack-gov.com https://*.slack-mcps.com"
+                ),
+            },
         )
 
     async def slack_events(request):
@@ -3067,6 +3303,7 @@ def _add_slack_routes(app, service) -> None:
                         include_full_text=True,
                         include_excerpt=True,
                         include_collectiveaccess=True,
+                        include_embed=_work_object_embeds_enabled(),
                     )
                     if detail_objects:
                         work_object = detail_objects[0]
@@ -3102,6 +3339,8 @@ def _add_slack_routes(app, service) -> None:
                             "display_order": ["description", *display_order],
                         },
                     }
+
+                work_object = _add_embed_preview_url_to_work_object(work_object, source_id)
 
                 present_payload = {
                     "trigger_id": event.get("trigger_id"),
@@ -3470,9 +3709,10 @@ def _add_slack_routes(app, service) -> None:
                     include_full_text=True,
                     include_excerpt=True,
                     include_collectiveaccess=True,
+                    include_embed=_work_object_embeds_enabled(),
                 )
                 if work_objects:
-                    work_object = work_objects[0]
+                    work_object = _add_embed_preview_url_to_work_object(work_objects[0], source_id)
                     try:
                         await _call_slack_api_async(token=token, method="entity.presentDetails", payload={
                             "trigger_id": payload.get("trigger_id"),
@@ -3493,6 +3733,7 @@ def _add_slack_routes(app, service) -> None:
         return JSONResponse({"ok": True})
 
     app.add_route("/slack/health", slack_health, methods=["GET"])
+    app.add_route("/slack/work-objects/embed/{source_id}", work_object_embed, methods=["GET"])
     app.add_route("/slack/events", slack_events, methods=["POST"])
     app.add_route("/slack/interactions", slack_interactions, methods=["POST"])
     app.add_route("/slack/commands/wavelength", wavelength_command, methods=["POST"])

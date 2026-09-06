@@ -11,6 +11,7 @@ SOURCE_MARKER_PATTERN = re.compile(r"\[SRC(\d+)\]")
 FOOTNOTE_PATTERN = re.compile(r"\[(?P<num>\d+)(?P<suffix>[a-z])?\]")
 WBEZ_WORK_OBJECT_ICON_URL = "https://mchonofsky-test-bucket.s3.us-east-2.amazonaws.com/wbez.jpg"
 CST_WORK_OBJECT_ICON_URL = "https://mchonofsky-test-bucket.s3.us-east-2.amazonaws.com/cst.jpg"
+SLACK_WORK_OBJECT_EMBED_MIME_TYPE = "application/vnd.slack-embed"
 # When we previously emitted `<url|[1]>` mrkdwn, normalize back to `[1]` so we
 # can render a source attachment mention element.
 SLACK_LINKED_FOOTNOTE_PATTERN = re.compile(r"<[^>|]+\|(?P<label>\[(?:\d+)(?:[a-z])?\])>")
@@ -868,6 +869,7 @@ def work_object_entities(
     include_full_text: bool = False,
     include_excerpt: bool = False,
     include_collectiveaccess: bool = False,
+    include_embed: bool = False,
 ) -> List[Dict[str, Any]]:
     """Build Item Work Object metadata for cited archive sources."""
     entities = []
@@ -887,7 +889,7 @@ def work_object_entities(
 
         date_value = _parse_date(source.get("publish_date"))
         icon_url = WBEZ_WORK_OBJECT_ICON_URL if _is_wbez(source) else CST_WORK_OBJECT_ICON_URL
-        product_icon = {"url": icon_url, "alt_text": "WBEZ" if transcript else "CST"} if icon_url else None
+        product_icon = {"url": icon_url, "alt_text": "WBEZ" if _is_wbez(source) else "CST"} if icon_url else None
         custom_fields: List[Dict[str, Any]] = [
             {
                 "key": "source_url",
@@ -988,17 +990,24 @@ def work_object_entities(
         if include_excerpt:
             display_order.append("excerpt")
 
+        attributes = {
+            "title": {"text": header_title},
+            "display_type": "Transcript" if transcript else "Article",
+            "display_id": str(source.get("number", "")),
+            **({"product_icon": product_icon} if product_icon else {}),
+        }
+        if include_embed:
+            attributes["full_size_preview"] = {
+                "is_supported": True,
+                "mime_type": SLACK_WORK_OBJECT_EMBED_MIME_TYPE,
+            }
+
         entities.append({
             "entity_type": "slack#/entities/item",
             "external_ref": {"id": external_id},
             "url": url,
             "entity_payload": {
-                "attributes": {
-                    "title": {"text": header_title},
-                    "display_type": "Transcript" if transcript else "Article",
-                    "display_id": str(source.get("number", "")),
-                    **({"product_icon": product_icon} if product_icon else {}),
-                },
+                "attributes": attributes,
                 "custom_fields": custom_fields,
                 "display_order": display_order,
             },

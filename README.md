@@ -125,7 +125,7 @@ Set `GRADIO_SERVER_PORT` to run the web app on a different port. The Wavelength 
 
 The Wavelength Slack app uses Slack Agent View, app mentions, DMs, and the `/wavelength` slash command. The Slack app should point event subscriptions at `/slack/events` and slash commands at `/slack/commands/wavelength`.
 
-For production, expose the service over public HTTPS (TLS 1.2+) and configure `WAVELENGTH_PUBLIC_BASE_URL`, `WAVELENGTH_MCP_AUTH_TOKEN`, and the persistent `WAVELENGTH_STATE_DB` volume. The MCP endpoint accepts only the bearer token; Slack signatures authenticate only Slack routes. Set `WAVELENGTH_RESPONSES_MCP_ENABLED=true` after the public endpoint has been verified from Azure.
+For production, expose the service over public HTTPS (TLS 1.2+) and configure `WAVELENGTH_PUBLIC_BASE_URL`, `WAVELENGTH_MCP_AUTH_TOKEN`, and the persistent `WAVELENGTH_STATE_DB` volume. Work Object Embeds also require `WAVELENGTH_EMBED_SIGNING_SECRET` and an HTTPS public base URL that is allowlisted in Slack's Work Objects and rich previews settings. The MCP endpoint accepts only the bearer token; Slack signatures authenticate only Slack routes. Set `WAVELENGTH_RESPONSES_MCP_ENABLED=true` after the public endpoint has been verified from Azure.
 
 MCP remains available at `/mcp` for this project's own clients, but the Slack app manifest does not need `mcp:connect` or an `mcp_servers` entry.
 

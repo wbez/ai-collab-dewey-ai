@@ -35,9 +35,10 @@ LOREM = (
 
 
 class LoremStreamingService:
-    def __init__(self, *, delay_seconds: float, chunk_words: int) -> None:
+    def __init__(self, *, delay_seconds: float, chunk_words: int, include_sources: bool = False) -> None:
         self.delay_seconds = delay_seconds
         self.chunk_words = max(1, chunk_words)
+        self.include_sources = include_sources
 
     def stream_archive(
         self,
@@ -58,14 +59,29 @@ class LoremStreamingService:
             if self.delay_seconds:
                 time.sleep(self.delay_seconds)
 
+        answer = f"{LOREM} [1]" if self.include_sources else LOREM
+        sources = [
+            {
+                "number": 1,
+                "source_id": "poc-lorem-source",
+                "title": "Lorem ipsum prototype source",
+                "url": "https://www.wbez.org/?wavelength-poc=lorem",
+                "publish_date": "2026-09-05",
+                "content_type": "article",
+                "excerpt": LOREM[:180],
+                "full_text": LOREM,
+                "authors": ["Wavelength Prototype"],
+            }
+        ] if self.include_sources else []
         yield {
             "type": "final",
             "payload": {
-                "content": [{"type": "text", "text": LOREM}],
+                "content": [{"type": "text", "text": answer}],
                 "_meta": {"slack": {"blocks": []}},
                 "structuredContent": {
-                    "answer": LOREM,
-                    "sources": [],
+                    "answer": answer,
+                    "answer_markdown": answer,
+                    "sources": sources,
                     "needs_clarification": False,
                 },
             },
@@ -93,6 +109,7 @@ def main() -> int:
     parser.add_argument("--channel", help="Slack channel/DM id, for example D123 or C123.")
     parser.add_argument("--user", help="Recipient Slack user id, for example U123.")
     parser.add_argument("--team", help="Recipient Slack team id, for example T123.")
+    parser.add_argument("--app-id", help="Slack api_app_id for Work Object mention rendering in this direct prototype.")
     parser.add_argument("--thread-ts", "--thread_ts", dest="thread_ts", help="Optional Slack thread timestamp.")
     parser.add_argument(
         "--seed-message",
@@ -101,6 +118,12 @@ def main() -> int:
     )
     parser.add_argument("--token", default=os.environ.get("SLACK_BOT_TOKEN"))
     parser.add_argument("--dry-run", action="store_true", help="Print Slack API calls instead of sending them.")
+    parser.add_argument("--embeds", action="store_true", help="Attach a cited Work Object that declares embed support.")
+    parser.add_argument(
+        "--public-base-url",
+        default=os.environ.get("WAVELENGTH_PUBLIC_BASE_URL"),
+        help="Public HTTPS base URL used for signed Work Object embed preview URLs.",
+    )
     parser.add_argument("--delay", type=float, default=0.15, help="Delay between text chunks.")
     parser.add_argument("--chunk-words", type=int, default=4, help="Words per streamed delta.")
     args = parser.parse_args()
@@ -110,7 +133,23 @@ def main() -> int:
         args.channel = args.channel or "DLOCAL"
         args.user = args.user or "ULOCAL"
         args.team = args.team or "TLOCAL"
+        args.app_id = args.app_id or "ALOCAL"
         args.token = args.token or "xoxb-dry-run"
+        args.public_base_url = args.public_base_url or "https://wavelength.example.test"
+
+    if args.embeds:
+        os.environ["WAVELENGTH_WORK_OBJECT_EMBEDS"] = "true"
+        if args.public_base_url:
+            os.environ["WAVELENGTH_PUBLIC_BASE_URL"] = args.public_base_url
+        if args.dry_run:
+            os.environ.setdefault("WAVELENGTH_EMBED_SIGNING_SECRET", "dry-run-embed-secret")
+        if not (os.environ.get("WAVELENGTH_PUBLIC_BASE_URL") or "").startswith("https://"):
+            parser.error("--embeds requires --public-base-url or WAVELENGTH_PUBLIC_BASE_URL with an HTTPS URL.")
+        if not os.environ.get("WAVELENGTH_EMBED_SIGNING_SECRET"):
+            parser.error("--embeds requires WAVELENGTH_EMBED_SIGNING_SECRET.")
+        if not args.team or not args.app_id:
+            parser.error("--embeds requires --team and --app-id so Work Object mentions can be rendered.")
+        mcp_server._cache_team_api_app_id(args.team, args.app_id)
 
     if not args.token:
         parser.error("Provide --token or SLACK_BOT_TOKEN, or use --dry-run.")
@@ -144,6 +183,7 @@ def main() -> int:
         service=LoremStreamingService(
             delay_seconds=args.delay,
             chunk_words=args.chunk_words,
+            include_sources=args.embeds,
         ),
         bot_token=args.token,
         question="POC lorem ipsum stream",

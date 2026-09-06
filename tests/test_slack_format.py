@@ -7,6 +7,7 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 from slack_format import (
+    SLACK_WORK_OBJECT_EMBED_MIME_TYPE,
     answer_blocks,
     block_kit_tool_result,
     cited_source_references,
@@ -151,6 +152,29 @@ def test_work_object_entities_add_display_type_and_article_fields():
     }
     assert article_fields["date"]["value"] == "2026-01-02"
     assert article_fields["author"]["value"] == "Reporter One, Reporter Two"
+
+
+def test_work_object_entities_can_declare_embed_support_without_preview_url():
+    entities = work_object_entities(
+        [
+            {
+                "number": 1,
+                "source_id": "story-1",
+                "title": "Archive Story",
+                "url": "https://example.com/story",
+                "publish_date": "2026-01-02",
+                "content_type": "article",
+            }
+        ],
+        include_embed=True,
+    )
+
+    full_size_preview = entities[0]["entity_payload"]["attributes"]["full_size_preview"]
+    assert full_size_preview == {
+        "is_supported": True,
+        "mime_type": SLACK_WORK_OBJECT_EMBED_MIME_TYPE,
+    }
+    assert "preview_url" not in full_size_preview
 
 
 def test_cited_source_references_excludes_unused_sources_and_renumbers():

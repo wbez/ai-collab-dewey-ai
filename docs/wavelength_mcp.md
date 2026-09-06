@@ -94,6 +94,9 @@ Wavelength-specific settings:
 SLACK_BOT_TOKEN="xoxb-..."
 SLACK_SIGNING_SECRET="..."
 WAVELENGTH_MCP_AUTH_TOKEN="replace-with-a-long-random-token"
+WAVELENGTH_PUBLIC_BASE_URL="https://wavelength.example.com"
+WAVELENGTH_EMBED_SIGNING_SECRET="replace-with-a-long-random-token"
+WAVELENGTH_WORK_OBJECT_EMBEDS="true"
 WAVELENGTH_ALLOWED_SLACK_TEAM_IDS="T01234567,T76543210"
 WAVELENGTH_ALLOWED_SLACK_USER_IDS="U01234567,U76543210"
 WAVELENGTH_SLASH_RESPONSE_TYPE="ephemeral"
@@ -117,13 +120,16 @@ Authentication behavior:
 - `SLACK_SIGNING_SECRET` enables Slack request signature verification for signed Slack requests.
 - `WAVELENGTH_ALLOWED_SLACK_TEAM_IDS` optionally restricts authenticated requests to specific Slack workspaces when Slack identity headers are present.
 - `WAVELENGTH_ALLOWED_SLACK_USER_IDS` optionally restricts authenticated requests to specific Slack users when Slack identity headers are present.
+- `WAVELENGTH_WORK_OBJECT_EMBEDS` enables iframe-based Work Object previews when `WAVELENGTH_PUBLIC_BASE_URL` is HTTPS and `WAVELENGTH_EMBED_SIGNING_SECRET` is configured.
+- `WAVELENGTH_EMBED_SIGNING_SECRET` signs short-lived Work Object embed URLs sent in `entity.presentDetails`.
 - `WAVELENGTH_SKIP_MCP_AUTH="true"` bypasses all MCP auth. Use it only for local smoke tests.
 - `WAVELENGTH_SKIP_SLACK_REQUEST_AUTH="true"` bypasses Slack Events API and slash command request signing. Use it only for local route tests.
 - `WAVELENGTH_SLASH_RESPONSE_TYPE` controls final slash command visibility. Use `ephemeral` or `in_channel`.
 
 Slack bot behavior:
 
-- `POST /slack/events` handles Events API URL verification, `app_mention`, and `message.im`.
+- `POST /slack/events` handles Events API URL verification, `app_mention`, `message.im`, and `entity_details_requested`.
+- `GET /slack/work-objects/embed/{source_id}` serves signed Work Object Embed iframe pages with Slack frame-ancestor CSP.
 - `POST /slack/commands/wavelength` handles `/wavelength`.
 - `GET /slack/health` is a lightweight health check.
 - Mention replies are posted in the thread by default.

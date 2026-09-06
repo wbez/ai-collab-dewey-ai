@@ -23,6 +23,9 @@ from mcp_server import MCPAuthMiddleware, _extract_bearer_token, _split_env_list
 @pytest.fixture(autouse=True)
 def clear_slack_thread_history():
     mcp_server._SLACK_THREAD_HISTORY.clear()
+    mcp_server._WORK_OBJECT_ENTITY_CACHE.clear()
+    mcp_server._WORK_OBJECT_SOURCE_CACHE.clear()
+    mcp_server._TEAM_API_APP_ID.clear()
 
 
 async def fake_app(scope, receive, send):
@@ -176,9 +179,12 @@ class CapturingStreamingService(FakeStreamingService):
 
 
 class FakeRequest:
-    def __init__(self, body=b"", headers=None):
+    def __init__(self, body=b"", headers=None, path="/", path_params=None, query_params=None):
         self._body = body
         self.headers = headers or {}
+        self.path_params = path_params or {}
+        self.query_params = query_params or {}
+        self.url = types.SimpleNamespace(path=path)
 
     async def body(self):
         return self._body
@@ -879,6 +885,34 @@ def test_work_object_metadata_trim_preserves_article_unfurl_fields():
     assert fields["author"]["value"] == "Reporter One, Reporter Two"
 
 
+def test_work_object_metadata_batches_declare_embeds_without_preview_url(monkeypatch):
+    monkeypatch.setenv("WAVELENGTH_PUBLIC_BASE_URL", "https://wavelength.example")
+    monkeypatch.setenv("WAVELENGTH_EMBED_SIGNING_SECRET", "secret")
+    batches = mcp_server._tool_payload_work_object_metadata_batches(
+        {
+            "structuredContent": {
+                "sources": [
+                    {
+                        "number": 1,
+                        "source_id": "story-1",
+                        "title": "Archive Story",
+                        "url": "https://example.com/story",
+                        "publish_date": "2026-01-02",
+                        "content_type": "article",
+                    }
+                ]
+            }
+        }
+    )
+
+    full_size_preview = batches[0]["entities"][0]["entity_payload"]["attributes"]["full_size_preview"]
+    assert full_size_preview == {
+        "is_supported": True,
+        "mime_type": "application/vnd.slack-embed",
+    }
+    assert "preview_url" not in full_size_preview
+
+
 def test_post_slack_message_with_work_objects_posts_remaining_batches(monkeypatch):
     posted = []
     sources = [
@@ -924,6 +958,106 @@ def test_work_object_source_id_from_event_prefers_external_ref():
     assert mcp_server._work_object_source_id_from_event(
         {"entity": {"external_ref": {"id": "story-2"}}}
     ) == "story-2"
+
+
+def test_work_object_details_present_embed_preview_url(monkeypatch):
+    calls = []
+
+    async def fake_call_slack_api_async(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setenv("WAVELENGTH_SKIP_SLACK_REQUEST_AUTH", "true")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("WAVELENGTH_ALLOWED_SLACK_USER_IDS", "U1")
+    monkeypatch.setenv("WAVELENGTH_PUBLIC_BASE_URL", "https://wavelength.example")
+    monkeypatch.setenv("WAVELENGTH_EMBED_SIGNING_SECRET", "secret")
+    monkeypatch.setattr(mcp_server, "_call_slack_api_async", fake_call_slack_api_async)
+    mcp_server._cache_work_object_sources(
+        [
+            {
+                "number": 1,
+                "source_id": "story-1",
+                "title": "Archive Story",
+                "url": "https://example.com/story",
+                "publish_date": "2026-01-02",
+                "content_type": "article",
+                "full_text": "Full source text.",
+            }
+        ]
+    )
+    app = Starlette()
+    mcp_server._add_slack_routes(app, FakeService())
+
+    response = asyncio.run(
+        route_endpoint(app, "/slack/events")(
+            FakeRequest(
+                body=(
+                    b'{"type":"event_callback","team_id":"T1","api_app_id":"A123",'
+                    b'"event":{"type":"entity_details_requested","trigger_id":"trigger-1",'
+                    b'"user":"U1","external_ref":{"id":"story-1"},'
+                    b'"entity_url":"https://example.com/story"}}'
+                )
+            )
+        )
+    )
+
+    assert response.status_code == 200
+    present_call = next(call for call in calls if call["method"] == "entity.presentDetails")
+    metadata = present_call["payload"]["metadata"]
+    full_size_preview = metadata["entity_payload"]["attributes"]["full_size_preview"]
+    assert full_size_preview["is_supported"] is True
+    assert full_size_preview["mime_type"] == "application/vnd.slack-embed"
+    assert full_size_preview["preview_url"].startswith(
+        "https://wavelength.example/slack/work-objects/embed/story-1?"
+    )
+
+
+def test_work_object_embed_route_requires_valid_signed_url(monkeypatch):
+    monkeypatch.setenv("WAVELENGTH_EMBED_SIGNING_SECRET", "secret")
+    mcp_server._cache_work_object_sources(
+        [
+            {
+                "number": 1,
+                "source_id": "story-1",
+                "title": "Archive Story",
+                "url": "https://example.com/story",
+                "publish_date": "2026-01-02",
+                "content_type": "article",
+                "full_text": "Full source text.",
+            }
+        ]
+    )
+    app = Starlette()
+    mcp_server._add_slack_routes(app, FakeService())
+    endpoint = route_endpoint(app, "/slack/work-objects/embed/{source_id}")
+    path = "/slack/work-objects/embed/story-1"
+
+    denied = asyncio.run(
+        endpoint(FakeRequest(path=path, path_params={"source_id": "story-1"}))
+    )
+
+    exp = int(time.time()) + 600
+    allowed = asyncio.run(
+        endpoint(
+            FakeRequest(
+                path=path,
+                path_params={"source_id": "story-1"},
+                query_params={
+                    "exp": str(exp),
+                    "sig": mcp_server._work_object_embed_signature(path, exp),
+                },
+            )
+        )
+    )
+
+    assert denied.status_code == 403
+    assert allowed.status_code == 200
+    assert b"Full source text." in allowed.body
+    assert (
+        allowed.headers["content-security-policy"]
+        == "frame-ancestors https://*.slack.com https://*.slack-gov.com https://*.slack-mcps.com"
+    )
 
 
 def test_slack_thread_history_falls_back_to_persisted_turns(monkeypatch, caplog):
